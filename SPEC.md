@@ -1,6 +1,6 @@
 # Symphony Service Specification
 
-Status: Draft v1 (language-agnostic)
+Status: Draft v1 (language: Rust)
 
 Purpose: Define a service that orchestrates coding agents to get project work done.
 
