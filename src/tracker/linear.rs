@@ -243,10 +243,7 @@ impl LinearClient {
             });
         }
 
-        let mut json: Value = response
-            .json()
-            .await
-            .map_err(Error::LinearApiRequest)?;
+        let mut json: Value = response.json().await.map_err(Error::LinearApiRequest)?;
 
         // Check for GraphQL-level errors.
         if let Some(errors) = json.get("errors") {
@@ -284,9 +281,7 @@ impl LinearClient {
             .map(|r| {
                 r.nodes
                     .into_iter()
-                    .filter(|rn| {
-                        rn.relation_type.as_deref() == Some("blocked_by")
-                    })
+                    .filter(|rn| rn.relation_type.as_deref() == Some("blocked_by"))
                     .filter_map(|rn| rn.related_issue)
                     .map(|ri| BlockerRef {
                         id: ri.id,
@@ -385,9 +380,7 @@ impl LinearClient {
 
         // If Linear reports a second page beyond our 250-item request, surface
         // it as a missing-cursor error rather than silently truncating.
-        if data.issues.page_info.has_next_page
-            && data.issues.page_info.end_cursor.is_none()
-        {
+        if data.issues.page_info.has_next_page && data.issues.page_info.end_cursor.is_none() {
             return Err(Error::LinearMissingEndCursor);
         }
 
@@ -414,9 +407,7 @@ impl LinearClient {
             "states": active_states,
         });
 
-        let nodes = self
-            .fetch_all_pages(FETCH_CANDIDATES_QUERY, vars)
-            .await?;
+        let nodes = self.fetch_all_pages(FETCH_CANDIDATES_QUERY, vars).await?;
 
         Ok(nodes.into_iter().map(Self::normalize_full).collect())
     }
@@ -436,9 +427,7 @@ impl LinearClient {
             "states": states,
         });
 
-        let nodes = self
-            .fetch_all_pages(FETCH_CANDIDATES_QUERY, vars)
-            .await?;
+        let nodes = self.fetch_all_pages(FETCH_CANDIDATES_QUERY, vars).await?;
 
         Ok(nodes.into_iter().map(Self::normalize_full).collect())
     }
@@ -510,7 +499,9 @@ mod tests {
             labels: Some(RawLabels {
                 nodes: labels
                     .into_iter()
-                    .map(|n| RawLabelNode { name: n.to_string() })
+                    .map(|n| RawLabelNode {
+                        name: n.to_string(),
+                    })
                     .collect(),
             }),
             relations: Some(RawRelations {

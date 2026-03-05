@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use tokio_util::sync::CancellationToken;
 
 // -------------------------------------------------------------------------- //
@@ -267,10 +267,7 @@ pub enum WorkerExitReason {
 #[derive(Debug)]
 pub enum WorkerEvent {
     /// A token-usage or notification update from the running Claude session.
-    ClaudeUpdate {
-        issue_id: String,
-        event: AgentEvent,
-    },
+    ClaudeUpdate { issue_id: String, event: AgentEvent },
     /// The worker task has finished (success or failure).
     WorkerExited {
         issue_id: String,

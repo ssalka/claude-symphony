@@ -9,11 +9,11 @@
 use std::path::PathBuf;
 
 use futures::StreamExt;
+use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 use tokio_util::codec::{FramedRead, LinesCodec};
-use std::process::Stdio;
 
 use crate::domain::{truncate, AgentEvent};
 use crate::error::{Error, Result};
@@ -112,9 +112,12 @@ impl ClaudeRunner {
             .expect("stderr must be piped (configured above)");
 
         // Write prompt and close stdin so claude knows input is complete.
-        stdin.write_all(prompt.as_bytes()).await.map_err(|e| Error::TurnFailed {
-            message: format!("write prompt to stdin: {e}"),
-        })?;
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .map_err(|e| Error::TurnFailed {
+                message: format!("write prompt to stdin: {e}"),
+            })?;
         drop(stdin);
 
         // ---- 4. Drain stderr in background ------------------------------- //
@@ -197,9 +200,7 @@ impl ClaudeRunner {
             let event: StreamEvent = match serde_json::from_str(&line) {
                 Ok(e) => e,
                 Err(_) => {
-                    let _ = event_tx
-                        .send(AgentEvent::OtherMessage { raw: line })
-                        .await;
+                    let _ = event_tx.send(AgentEvent::OtherMessage { raw: line }).await;
                     continue;
                 }
             };
@@ -286,17 +287,13 @@ impl ClaudeRunner {
                         return Ok(());
                     } else {
                         return Err(Error::TurnFailed {
-                            message: res
-                                .result
-                                .unwrap_or_else(|| "unknown error".to_string()),
+                            message: res.result.unwrap_or_else(|| "unknown error".to_string()),
                         });
                     }
                 }
 
                 StreamEvent::RateLimitEvent(_) | StreamEvent::Unknown => {
-                    let _ = event_tx
-                        .send(AgentEvent::OtherMessage { raw: line })
-                        .await;
+                    let _ = event_tx.send(AgentEvent::OtherMessage { raw: line }).await;
                 }
             }
         }
@@ -331,7 +328,6 @@ async fn stop_process(process: &mut Child) {
     let _ = process.start_kill();
 }
 
-
 // -------------------------------------------------------------------------- //
 // Unit tests
 // -------------------------------------------------------------------------- //
@@ -362,5 +358,4 @@ mod tests {
         assert_eq!(cloned.command, "claude");
         assert_eq!(cloned.turn_timeout_ms, 600_000);
     }
-
 }

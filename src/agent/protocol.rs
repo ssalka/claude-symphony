@@ -152,16 +152,14 @@ mod tests {
         let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/src/main.rs"},"id":"tu_1"}]}}"#;
         let event: StreamEvent = serde_json::from_str(json).unwrap();
         match event {
-            StreamEvent::Assistant(evt) => {
-                match &evt.message.content[0] {
-                    ContentBlock::ToolUse { name, input, id } => {
-                        assert_eq!(name, "Read");
-                        assert_eq!(input["file_path"], "/src/main.rs");
-                        assert_eq!(id.as_deref(), Some("tu_1"));
-                    }
-                    _ => panic!("expected ToolUse block"),
+            StreamEvent::Assistant(evt) => match &evt.message.content[0] {
+                ContentBlock::ToolUse { name, input, id } => {
+                    assert_eq!(name, "Read");
+                    assert_eq!(input["file_path"], "/src/main.rs");
+                    assert_eq!(id.as_deref(), Some("tu_1"));
                 }
-            }
+                _ => panic!("expected ToolUse block"),
+            },
             _ => panic!("expected Assistant event"),
         }
     }
@@ -224,7 +222,10 @@ mod tests {
             StreamEvent::Assistant(evt) => {
                 assert_eq!(evt.message.content.len(), 2);
                 assert!(matches!(&evt.message.content[0], ContentBlock::Text { .. }));
-                assert!(matches!(&evt.message.content[1], ContentBlock::ToolUse { .. }));
+                assert!(matches!(
+                    &evt.message.content[1],
+                    ContentBlock::ToolUse { .. }
+                ));
             }
             _ => panic!("expected Assistant event"),
         }
@@ -244,7 +245,8 @@ mod tests {
 
     #[test]
     fn test_content_block_other_variant() {
-        let json = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}"#;
+        let json =
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}"#;
         let event: StreamEvent = serde_json::from_str(json).unwrap();
         match event {
             StreamEvent::Assistant(evt) => {

@@ -1,14 +1,14 @@
 use axum::{
-    Router,
     extract::{Path, State},
+    http::StatusCode,
     response::{Html, IntoResponse, Json},
     routing::{get, post},
-    http::StatusCode,
+    Router,
 };
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
-use serde_json::json;
 use chrono::Utc;
+use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::domain::OrchestratorState;
 
@@ -87,7 +87,10 @@ async fn get_issue(
 /// POST /api/v1/refresh — trigger an immediate orchestrator poll tick.
 async fn trigger_refresh(State(app): State<Arc<AppState>>) -> impl IntoResponse {
     let _ = app.refresh_tx.try_send(());
-    (StatusCode::ACCEPTED, Json(json!({"status": "refresh triggered"})))
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"status": "refresh triggered"})),
+    )
 }
 
 // -------------------------------------------------------------------------- //
@@ -130,8 +133,8 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
     use crate::domain::{ClaudeTotals, OrchestratorState};
+    use std::collections::{HashMap, HashSet};
 
     fn make_orchestrator_state() -> Arc<Mutex<OrchestratorState>> {
         Arc::new(Mutex::new(OrchestratorState {

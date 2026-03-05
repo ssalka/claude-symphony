@@ -125,11 +125,8 @@ pub async fn run_hook(script: &str, cwd: &std::path::Path, timeout_ms: u64) -> R
         .spawn()
         .map_err(Error::WorkspaceCreationFailed)?;
 
-    let result = tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        child.wait_with_output(),
-    )
-    .await;
+    let result =
+        tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await;
 
     match result {
         Err(_elapsed) => Err(Error::HookTimeout { timeout_ms }),

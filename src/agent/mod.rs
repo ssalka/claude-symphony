@@ -279,13 +279,13 @@ mod tests {
 
         token.cancel();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            watch_rx.changed(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), watch_rx.changed()).await;
         assert!(result.is_ok(), "watch should update within 200ms");
-        assert!(*watch_rx.borrow(), "watch value should be true after cancel");
+        assert!(
+            *watch_rx.borrow(),
+            "watch value should be true after cancel"
+        );
     }
 
     #[test]
@@ -325,7 +325,9 @@ mod tests {
 
         let ev = rx.try_recv().unwrap();
         match ev {
-            WorkerEvent::WorkerExited { issue_id, reason, .. } => {
+            WorkerEvent::WorkerExited {
+                issue_id, reason, ..
+            } => {
                 assert_eq!(issue_id, "issue-2");
                 assert!(matches!(reason, WorkerExitReason::Normal));
             }
@@ -347,7 +349,9 @@ mod tests {
 
         let ev = rx.try_recv().unwrap();
         match ev {
-            WorkerEvent::WorkerExited { issue_id, reason, .. } => {
+            WorkerEvent::WorkerExited {
+                issue_id, reason, ..
+            } => {
                 assert_eq!(issue_id, "issue-3");
                 match reason {
                     WorkerExitReason::Abnormal { error } => {

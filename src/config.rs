@@ -578,7 +578,10 @@ orchestrator:
         )
         .unwrap();
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
-        assert_eq!(cfg.max_concurrent_agents_by_state.get("in progress"), Some(&2));
+        assert_eq!(
+            cfg.max_concurrent_agents_by_state.get("in progress"),
+            Some(&2)
+        );
         assert_eq!(cfg.max_concurrent_agents_by_state.get("todo"), Some(&1));
     }
 
@@ -651,7 +654,10 @@ agent:
         .unwrap();
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
         let err = cfg.validate_for_dispatch().unwrap_err();
-        assert!(matches!(err, crate::error::Error::MissingTrackerProjectSlug));
+        assert!(matches!(
+            err,
+            crate::error::Error::MissingTrackerProjectSlug
+        ));
     }
 
     #[test]

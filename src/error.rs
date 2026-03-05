@@ -237,10 +237,7 @@ mod tests {
         let err = Error::LinearGraphqlErrors {
             errors: r#"[{"message":"not found"}]"#.to_string(),
         };
-        assert_display(
-            &err,
-            r#"linear GraphQL errors: [{"message":"not found"}]"#,
-        );
+        assert_display(&err, r#"linear GraphQL errors: [{"message":"not found"}]"#);
     }
 
     #[test]
@@ -278,10 +275,7 @@ mod tests {
 
     #[test]
     fn test_workspace_creation_failed() {
-        let io_err = std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "permission denied",
-        );
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
         let err = Error::WorkspaceCreationFailed(io_err);
         assert!(err.to_string().contains("workspace creation failed"));
         // Verify source is accessible via std::error::Error trait.

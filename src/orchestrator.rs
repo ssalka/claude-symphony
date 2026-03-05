@@ -94,9 +94,7 @@ impl Orchestrator {
                 let mut state = self.state.lock().await;
                 for issue in issues {
                     // Best-effort workspace cleanup.
-                    if let Err(e) =
-                        workspace::cleanup_workspace(&issue.identifier, config).await
-                    {
+                    if let Err(e) = workspace::cleanup_workspace(&issue.identifier, config).await {
                         tracing::warn!(
                             identifier = %issue.identifier,
                             error = %e,
@@ -153,7 +151,10 @@ impl Orchestrator {
                 // 5. Fetch candidates.
                 let mut candidates = match self
                     .tracker
-                    .fetch_candidate_issues(&config.active_states_original, &config.tracker_project_slug)
+                    .fetch_candidate_issues(
+                        &config.active_states_original,
+                        &config.tracker_project_slug,
+                    )
                     .await
                 {
                     Ok(c) => {
@@ -216,9 +217,7 @@ impl Orchestrator {
                 let stall_elapsed_ms = if let Some(ref ls) = entry.live_session {
                     if let Some(ts) = ls.last_event_timestamp {
                         let now = chrono::Utc::now();
-                        now.signed_duration_since(ts)
-                            .num_milliseconds()
-                            .max(0) as u64
+                        now.signed_duration_since(ts).num_milliseconds().max(0) as u64
                     } else {
                         elapsed_ms
                     }
@@ -481,7 +480,11 @@ impl Orchestrator {
                 WorkerEvent::ClaudeUpdate { issue_id, event } => {
                     self.handle_claude_update(&issue_id, event).await;
                 }
-                WorkerEvent::WorkerExited { issue_id, dispatch_id, reason } => {
+                WorkerEvent::WorkerExited {
+                    issue_id,
+                    dispatch_id,
+                    reason,
+                } => {
                     // We need config for backoff calculation. Try to parse it;
                     // fall back to a sensible default if parsing fails.
                     let max_backoff = {
@@ -490,7 +493,8 @@ impl Orchestrator {
                             .map(|c| c.agent_max_retry_backoff_ms)
                             .unwrap_or(300_000)
                     };
-                    self.handle_worker_exit(&issue_id, dispatch_id, reason, max_backoff).await;
+                    self.handle_worker_exit(&issue_id, dispatch_id, reason, max_backoff)
+                        .await;
                 }
             }
         }
@@ -518,9 +522,7 @@ impl Orchestrator {
                 output_tokens,
             } => {
                 if let Some(entry) = state.running.get_mut(issue_id) {
-                    let ls = entry
-                        .live_session
-                        .get_or_insert_with(LiveSession::default);
+                    let ls = entry.live_session.get_or_insert_with(LiveSession::default);
 
                     let delta_in = input_tokens.saturating_sub(ls.last_reported_input_tokens);
                     let delta_out = output_tokens.saturating_sub(ls.last_reported_output_tokens);
@@ -539,9 +541,7 @@ impl Orchestrator {
             AgentEvent::Notification { message } => {
                 // Ensure live session exists for notification events.
                 if let Some(entry) = state.running.get_mut(issue_id) {
-                    entry
-                        .live_session
-                        .get_or_insert_with(LiveSession::default);
+                    entry.live_session.get_or_insert_with(LiveSession::default);
                 }
                 tracing::trace!(issue_id = %issue_id, message = %message, "Agent notification");
                 ("notification".to_string(), Some(message))
@@ -556,7 +556,10 @@ impl Orchestrator {
                 summary,
             } => {
                 tracing::trace!("[{identifier}] Tool {phase}: {tool_name} | {summary}");
-                (format!("tool_{phase}"), Some(format!("{tool_name}: {summary}")))
+                (
+                    format!("tool_{phase}"),
+                    Some(format!("{tool_name}: {summary}")),
+                )
             }
             AgentEvent::TurnResult {
                 success,
@@ -1022,11 +1025,10 @@ mod tests {
             }
         }
 
-        let (config_tx, config_rx) =
-            tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
-                config: serde_yaml::Value::Null,
-                prompt_template: String::new(),
-            }));
+        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
+            config: serde_yaml::Value::Null,
+            prompt_template: String::new(),
+        }));
         let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         // Keep sender alive to prevent watch from closing.
