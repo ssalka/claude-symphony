@@ -150,7 +150,7 @@ impl Orchestrator {
                 // 5. Fetch candidates.
                 let mut candidates = match self
                     .tracker
-                    .fetch_candidate_issues(&config.active_states, &config.tracker_project_slug)
+                    .fetch_candidate_issues(&config.active_states_original, &config.tracker_project_slug)
                     .await
                 {
                     Ok(c) => {
@@ -801,6 +801,8 @@ mod tests {
             max_concurrent_agents_by_state: HashMap::new(),
             active_states: vec!["in progress".to_string(), "todo".to_string()],
             terminal_states: vec!["done".to_string(), "cancelled".to_string()],
+            active_states_original: vec!["In Progress".to_string(), "Todo".to_string()],
+            terminal_states_original: vec!["Done".to_string(), "Cancelled".to_string()],
             server_enabled: false,
             server_port: 8080,
         }

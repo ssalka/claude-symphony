@@ -242,6 +242,8 @@ mod tests {
             max_concurrent_agents_by_state: HashMap::new(),
             active_states: vec![],
             terminal_states: vec![],
+            active_states_original: vec![],
+            terminal_states_original: vec![],
             server_enabled: false,
             server_port: 8080,
         }

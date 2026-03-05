@@ -36,6 +36,8 @@ pub struct ServiceConfig {
     pub max_concurrent_agents_by_state: HashMap<String, usize>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
+    pub active_states_original: Vec<String>,
+    pub terminal_states_original: Vec<String>,
     // server
     pub server_enabled: bool,
     pub server_port: u16,
@@ -75,21 +77,23 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 /// Parse a YAML value that is either a sequence of strings or a single
-/// comma-separated string. Returns each entry trimmed and lowercased.
-fn parse_state_list(val: &serde_yaml::Value) -> Vec<String> {
-    match val {
+/// comma-separated string. Returns `(lowercased, original_case)` pairs.
+fn parse_state_list_preserve_case(val: &serde_yaml::Value) -> (Vec<String>, Vec<String>) {
+    let original: Vec<String> = match val {
         serde_yaml::Value::Sequence(seq) => seq
             .iter()
             .filter_map(|v| v.as_str())
-            .map(|s| s.trim().to_lowercase())
+            .map(|s| s.trim().to_string())
             .collect(),
         serde_yaml::Value::String(s) => s
             .split(',')
-            .map(|part| part.trim().to_lowercase())
+            .map(|part| part.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect(),
         _ => vec![],
-    }
+    };
+    let lowered = original.iter().map(|s| s.to_lowercase()).collect();
+    (lowered, original)
 }
 
 /// Retrieve an optional string from a YAML map.
@@ -218,14 +222,14 @@ impl ServiceConfig {
             })
             .unwrap_or_default();
 
-        let active_states = orchestrator
+        let (active_states, active_states_original) = orchestrator
             .get("active_states")
-            .map(|v| parse_state_list(v))
+            .map(parse_state_list_preserve_case)
             .unwrap_or_default();
 
-        let terminal_states = orchestrator
+        let (terminal_states, terminal_states_original) = orchestrator
             .get("terminal_states")
-            .map(|v| parse_state_list(v))
+            .map(parse_state_list_preserve_case)
             .unwrap_or_default();
 
         // ---- server ---------------------------------------------------------
@@ -264,6 +268,8 @@ impl ServiceConfig {
             max_concurrent_agents_by_state,
             active_states,
             terminal_states,
+            active_states_original,
+            terminal_states_original,
             server_enabled,
             server_port,
         })
@@ -444,6 +450,8 @@ orchestrator:
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
         assert_eq!(cfg.active_states, vec!["in progress", "todo"]);
         assert_eq!(cfg.terminal_states, vec!["done", "cancelled"]);
+        assert_eq!(cfg.active_states_original, vec!["In Progress", "Todo"]);
+        assert_eq!(cfg.terminal_states_original, vec!["Done", "Cancelled"]);
     }
 
     #[test]
@@ -467,6 +475,11 @@ orchestrator:
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
         assert_eq!(cfg.active_states, vec!["in progress", "todo"]);
         assert_eq!(cfg.terminal_states, vec!["done", "cancelled", "duplicate"]);
+        assert_eq!(cfg.active_states_original, vec!["In Progress", "Todo"]);
+        assert_eq!(
+            cfg.terminal_states_original,
+            vec!["Done", "Cancelled", "Duplicate"]
+        );
     }
 
     // ---- env var resolution -------------------------------------------------
