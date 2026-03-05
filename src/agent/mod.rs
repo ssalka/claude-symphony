@@ -10,7 +10,7 @@ use crate::domain::{AgentEvent, Issue, WorkerEvent, WorkflowDefinition};
 use crate::error::{Error, Result};
 use crate::{prompt, workspace};
 
-use self::session::{ClaudeSession, SessionConfig};
+use self::session::{ClaudeRunner, SessionConfig};
 
 // -------------------------------------------------------------------------- //
 // AgentRunner
@@ -38,14 +38,13 @@ impl AgentRunner {
     /// Steps:
     /// 1. Create (or reuse) the workspace directory.
     /// 2. Render the prompt from the workflow template.
-    /// 3. Start a Claude Code session.
+    /// 3. Create a `ClaudeRunner` (no process spawned yet).
     /// 4. Run up to `config.agent_max_turns` turns, forwarding
     ///    [`AgentEvent`]s as [`WorkerEvent::ClaudeUpdate`] to the orchestrator.
     /// 5. Return `Ok(())` on successful completion or `Err(_)` on failure.
     ///
-    /// Cancellation is signalled via `cancel_rx`.  When the oneshot fires the
-    /// current turn is interrupted, the session is stopped, and
-    /// [`Error::TurnCancelled`] is returned.
+    /// Cancellation is signalled via `cancel_rx`. When the oneshot fires the
+    /// current turn is interrupted and [`Error::TurnCancelled`] is returned.
     pub async fn run(
         self,
         issue: Issue,
@@ -58,23 +57,16 @@ impl AgentRunner {
         // ---- 2. Render prompt -------------------------------------------- //
         let prompt = prompt::render_prompt(&self.workflow.prompt_template, &issue, Some(attempt))?;
 
-        // ---- 3. Build title ---------------------------------------------- //
-        let title = format!("{}: {}", issue.identifier, issue.title);
-
-        // ---- 4. Start session -------------------------------------------- //
+        // ---- 3. Build runner --------------------------------------------- //
         let session_config = SessionConfig {
             command: self.config.agent_command.clone(),
             workspace_path: workspace.path.clone(),
-            approval_policy: self.config.agent_approval_policy.clone(),
-            sandbox_policy: self.config.agent_sandbox_policy.clone(),
-            read_timeout_ms: self.config.agent_read_timeout_ms,
             turn_timeout_ms: self.config.agent_turn_timeout_ms,
         };
 
-        let (mut session, thread_id, _turn_id, _session_id) =
-            ClaudeSession::start(&session_config).await?;
+        let mut runner = ClaudeRunner::new(session_config);
 
-        // ---- 5. Convert the oneshot cancel into a watch so it can be
+        // ---- 4. Convert the oneshot cancel into a watch so it can be
         //         observed across multiple turn iterations.                  //
         let (cancel_watch_tx, mut cancel_watch_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
@@ -82,16 +74,10 @@ impl AgentRunner {
             let _ = cancel_watch_tx.send(true);
         });
 
-        // ---- 6. Turn loop ------------------------------------------------ //
+        // ---- 5. Turn loop ------------------------------------------------ //
         let max_turns = self.config.agent_max_turns;
-        let turn_timeout_ms = self.config.agent_turn_timeout_ms;
         let issue_id = issue.id.clone();
         let event_tx = self.event_tx.clone();
-
-        // Start the first turn with the rendered prompt.
-        session
-            .start_turn(&thread_id, &prompt, &title, &workspace.path)
-            .await?;
 
         let mut turn_count = 0u32;
         loop {
@@ -99,21 +85,20 @@ impl AgentRunner {
 
             // Pre-turn cancellation check.
             if *cancel_watch_rx.borrow() {
-                session.stop();
                 return Err(Error::TurnCancelled);
             }
+
+            // Determine the prompt for this turn.
+            let turn_prompt = if turn_count == 1 {
+                prompt.clone()
+            } else {
+                self.config.agent_continuation_guidance.clone()
+            };
 
             // Create an inner channel for AgentEvents from run_turn.
             let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(100);
 
-            // Run the turn concurrently with event forwarding and cancellation
-            // watching.
-            //
-            // We use an approach where run_turn is driven on the current task
-            // via a local future, and we interleave event forwarding.
-            // Because run_turn holds &mut session, we cannot split it from
-            // the event forwarding.  Instead we forward events inside a
-            // separate spawned task and drive run_turn here.
+            // Spawn event forwarder task.
             let (forward_tx, forward_rx) = tokio::sync::oneshot::channel::<()>();
             let forward_event_tx = event_tx.clone();
             let forward_issue_id = issue_id.clone();
@@ -126,25 +111,13 @@ impl AgentRunner {
                         })
                         .await;
                 }
-                // Signal that all forwarding is done.
                 let _ = forward_tx.send(());
             });
 
-            // Run the actual turn, watching for cancellation at the same time.
-            let turn_result: Result<()> = tokio::select! {
-                result = session.run_turn(turn_timeout_ms, &agent_tx) => result,
-                _ = cancel_watch_rx.changed() => {
-                    // Cancellation arrived while the turn was running.
-                    // Drop agent_tx to close the channel so the forwarder
-                    // exits cleanly, then stop the session.
-                    drop(agent_tx);
-                    // Wait for the event forwarder to drain.
-                    let _ = forward_rx.await;
-                    forward_handle.abort();
-                    session.stop();
-                    return Err(Error::TurnCancelled);
-                }
-            };
+            // Run the turn. Cancellation is handled inside run_turn.
+            let turn_result = runner
+                .run_turn(&turn_prompt, &agent_tx, &mut cancel_watch_rx)
+                .await;
 
             // Drop agent_tx so the event-forwarder task knows the turn is done.
             drop(agent_tx);
@@ -156,20 +129,10 @@ impl AgentRunner {
             // Propagate any turn errors.
             turn_result?;
 
-            // Successful turn.  Decide whether to continue.
+            // Successful turn. Decide whether to continue.
             if turn_count >= max_turns {
                 break;
             }
-
-            // Start a continuation turn.
-            session
-                .start_turn(
-                    &thread_id,
-                    &self.config.agent_continuation_guidance,
-                    &title,
-                    &workspace.path,
-                )
-                .await?;
         }
 
         Ok(())
@@ -201,7 +164,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp/symphony-test-workspaces"),
             workspace_after_create: None,
             workspace_before_remove: None,
-            agent_command: "claude --output-format stream-json --verbose".to_string(),
+            agent_command: "claude".to_string(),
             agent_approval_policy: "auto".to_string(),
             agent_sandbox_policy: None,
             agent_max_turns: 5,
@@ -258,7 +221,6 @@ mod tests {
             workflow: make_workflow(),
             event_tx,
         };
-        // Verify fields are accessible.
         assert_eq!(runner.config.agent_max_turns, 5);
         assert_eq!(
             runner.workflow.prompt_template,
@@ -305,20 +267,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancellation_oneshot_fires_immediately() {
-        // Verifies the oneshot → watch conversion logic works at the type level.
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let (watch_tx, mut watch_rx) = tokio::sync::watch::channel(false);
 
-        // Spawn the bridge task (same pattern as AgentRunner::run).
         tokio::spawn(async move {
             let _ = cancel_rx.await;
             let _ = watch_tx.send(true);
         });
 
-        // Fire cancellation.
         let _ = cancel_tx.send(());
 
-        // The watch should become true quickly.
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             watch_rx.changed(),
@@ -432,15 +390,10 @@ mod tests {
 
     #[test]
     fn test_session_config_built_from_service_config() {
-        // Verify that all fields needed to build a SessionConfig are present in
-        // ServiceConfig with the right types.
         let cfg = make_config();
         let _session_cfg = SessionConfig {
             command: cfg.agent_command.clone(),
             workspace_path: cfg.workspace_root.clone(),
-            approval_policy: cfg.agent_approval_policy.clone(),
-            sandbox_policy: cfg.agent_sandbox_policy.clone(),
-            read_timeout_ms: cfg.agent_read_timeout_ms,
             turn_timeout_ms: cfg.agent_turn_timeout_ms,
         };
         // If this compiled, the field mapping is correct.

@@ -559,8 +559,83 @@ impl Orchestrator {
                 }
                 tracing::info!(issue_id = %issue_id, message = %message, "Agent notification");
             }
+            AgentEvent::AssistantText { text } => {
+                let identifier = state
+                    .running
+                    .get(issue_id)
+                    .map(|e| e.issue.identifier.as_str())
+                    .unwrap_or(issue_id);
+                tracing::info!("[{identifier}] {text}");
+                if let Some(entry) = state.running.get_mut(issue_id) {
+                    if let Some(ref mut ls) = entry.live_session {
+                        ls.last_event = Some("assistant_text".to_string());
+                        ls.last_event_timestamp = Some(chrono::Utc::now());
+                        ls.last_event_message = Some(text);
+                    }
+                }
+            }
+            AgentEvent::ToolEvent {
+                tool_name,
+                phase,
+                summary,
+            } => {
+                let identifier = state
+                    .running
+                    .get(issue_id)
+                    .map(|e| e.issue.identifier.as_str())
+                    .unwrap_or(issue_id);
+                tracing::info!("[{identifier}] Tool {phase}: {tool_name} | {summary}");
+                if let Some(entry) = state.running.get_mut(issue_id) {
+                    if let Some(ref mut ls) = entry.live_session {
+                        ls.last_event = Some(format!("tool_{phase}"));
+                        ls.last_event_timestamp = Some(chrono::Utc::now());
+                        ls.last_event_message =
+                            Some(format!("{tool_name}: {summary}"));
+                    }
+                }
+            }
+            AgentEvent::TurnResult {
+                success,
+                duration_ms,
+                total_cost_usd,
+                ..
+            } => {
+                let identifier = state
+                    .running
+                    .get(issue_id)
+                    .map(|e| e.issue.identifier.as_str())
+                    .unwrap_or(issue_id);
+                tracing::info!(
+                    "[{identifier}] Turn {}: {}ms, ${:.4}",
+                    if success { "completed" } else { "failed" },
+                    duration_ms.unwrap_or(0),
+                    total_cost_usd.unwrap_or(0.0)
+                );
+                if let Some(entry) = state.running.get_mut(issue_id) {
+                    if let Some(ref mut ls) = entry.live_session {
+                        ls.last_event = Some("turn_result".to_string());
+                        ls.last_event_timestamp = Some(chrono::Utc::now());
+                        ls.last_event_message = Some(format!(
+                            "{}; {}ms; ${:.4}",
+                            if success { "success" } else { "failed" },
+                            duration_ms.unwrap_or(0),
+                            total_cost_usd.unwrap_or(0.0)
+                        ));
+                    }
+                }
+            }
             AgentEvent::OtherMessage { raw } => {
-                tracing::debug!(issue_id = %issue_id, raw = %raw, "Agent other message");
+                let identifier = state
+                    .running
+                    .get(issue_id)
+                    .map(|e| e.issue.identifier.as_str())
+                    .unwrap_or(issue_id);
+                let msg = if raw.len() > 120 {
+                    format!("{}…", &raw[..120])
+                } else {
+                    raw.clone()
+                };
+                tracing::info!("[{identifier}] {msg}");
                 if let Some(entry) = state.running.get_mut(issue_id) {
                     if let Some(ref mut ls) = entry.live_session {
                         ls.last_event = Some("other".to_string());

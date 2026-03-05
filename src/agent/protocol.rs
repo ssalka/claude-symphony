@@ -1,118 +1,109 @@
-//! JSON-RPC 2.0 message types for the Claude Code stdio protocol.
+//! Stream-JSON event types for the Claude CLI protocol.
 //!
-//! Claude Code communicates over stdio using a JSON-RPC 2.0-style protocol.
-//! This module defines the request/response envelope types and the
-//! domain-specific result payloads used during session initialization.
+//! Claude CLI v2+ uses `--output-format stream-json` and emits newline-delimited
+//! JSON events. Each event has a `"type"` field that determines its structure.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 // -------------------------------------------------------------------------- //
-// Outgoing requests
+// Stream event envelope
 // -------------------------------------------------------------------------- //
 
-/// A JSON-RPC 2.0 request (or notification when `id` is `None`).
-///
-/// Serialized directly to the Claude Code subprocess stdin, one JSON object
-/// per line.
-#[derive(Debug, Serialize)]
-pub struct Request {
-    /// `null` for notifications (no reply expected), otherwise a u64 request id.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<Value>,
-
-    /// The RPC method name (e.g. `"initialize"`, `"thread/start"`).
-    pub method: String,
-
-    /// Method parameters as an arbitrary JSON value (usually an object).
-    pub params: Value,
-}
-
-impl Request {
-    /// Create a request that expects a response, identified by `id`.
-    pub fn with_id(id: u64, method: impl Into<String>, params: Value) -> Self {
-        Self {
-            id: Some(Value::Number(id.into())),
-            method: method.into(),
-            params,
-        }
-    }
-
-    /// Create a notification (no response expected — `id` field omitted).
-    pub fn notification(method: impl Into<String>, params: Value) -> Self {
-        Self {
-            id: None,
-            method: method.into(),
-            params,
-        }
-    }
+/// A single event from the Claude CLI stream-json output.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamEvent {
+    /// Emitted once at the start of a session.
+    System(SystemEvent),
+    /// Assistant message content (text, tool use, etc.).
+    Assistant(AssistantEvent),
+    /// Terminal event indicating the run completed.
+    Result(ResultEvent),
+    /// Rate limit information from the API.
+    #[serde(rename = "rate_limit_event")]
+    RateLimitEvent(RateLimitEvent),
+    /// Any other event type we don't explicitly handle.
+    #[serde(other)]
+    Unknown,
 }
 
 // -------------------------------------------------------------------------- //
-// Generic incoming response / event envelope
+// Event payloads
 // -------------------------------------------------------------------------- //
 
-/// Generic JSON-RPC response or server-initiated event envelope.
-///
-/// Claude Code sends both reply messages (matching a prior request `id`) and
-/// unsolicited event notifications (where `method` is populated and `id` may
-/// be absent or carry the originating request id for approval flows).
+/// System init event — carries the session ID and model info.
 #[derive(Debug, Deserialize)]
-pub struct Response {
-    /// Present on replies to requests.  May also be present on approval
-    /// requests so that the client can send an approval response with the
-    /// same id.
-    pub id: Option<Value>,
-
-    /// Populated on success replies.
-    pub result: Option<Value>,
-
-    /// Populated on error replies.
-    pub error: Option<Value>,
-
-    /// Populated on server-initiated events / notifications.
-    pub method: Option<String>,
-
-    /// Parameters accompanying a server-initiated event.
-    pub params: Option<Value>,
+pub struct SystemEvent {
+    pub subtype: Option<String>,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub tools: Option<Value>,
 }
 
-// -------------------------------------------------------------------------- //
-// Strongly-typed result payloads
-// -------------------------------------------------------------------------- //
-
-/// Decoded result payload for the `initialize` method response.
+/// Assistant message event — carries content blocks and usage.
 #[derive(Debug, Deserialize)]
-pub struct InitializeResult {
-    /// The protocol version negotiated by the server.  Optional because some
-    /// implementations omit it.
-    pub protocol_version: Option<String>,
+pub struct AssistantEvent {
+    pub message: AssistantMessage,
+    pub session_id: Option<String>,
 }
 
-/// Decoded result payload for the `thread/start` method response.
+/// The message body within an assistant event.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadStartResult {
-    pub thread: ThreadInfo,
+pub struct AssistantMessage {
+    #[serde(default)]
+    pub content: Vec<ContentBlock>,
+    pub usage: Option<Usage>,
 }
 
-/// Thread identity returned by `thread/start`.
+/// A single content block within an assistant message.
 #[derive(Debug, Deserialize)]
-pub struct ThreadInfo {
-    pub id: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    /// Plain text output.
+    Text { text: String },
+    /// Tool invocation.
+    ToolUse {
+        name: String,
+        input: Value,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Tool result (returned in subsequent messages).
+    ToolResult {
+        tool_use_id: Option<String>,
+        content: Option<Value>,
+    },
+    /// Any other content block type.
+    #[serde(other)]
+    Other,
 }
 
-/// Decoded result payload for the `turn/start` method response.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnStartResult {
-    pub turn: TurnInfo,
+/// Token usage counters.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
 }
 
-/// Turn identity returned by `turn/start`.
+/// Terminal result event — indicates the run completed or failed.
 #[derive(Debug, Deserialize)]
-pub struct TurnInfo {
-    pub id: String,
+pub struct ResultEvent {
+    pub subtype: Option<String>,
+    pub result: Option<String>,
+    pub session_id: Option<String>,
+    pub usage: Option<Usage>,
+    pub total_cost_usd: Option<f64>,
+    pub duration_ms: Option<u64>,
+    pub num_turns: Option<u32>,
+}
+
+/// Rate limit event payload.
+#[derive(Debug, Deserialize)]
+pub struct RateLimitEvent {
+    pub rate_limit_info: Option<Value>,
 }
 
 // -------------------------------------------------------------------------- //
@@ -122,176 +113,153 @@ pub struct TurnInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    // ---- Request serialization -------------------------------------------- //
 
     #[test]
-    fn test_request_with_id_serializes_id_field() {
-        let req = Request::with_id(1, "initialize", json!({"foo": "bar"}));
-        let json = serde_json::to_value(&req).unwrap();
-
-        assert_eq!(json["id"], json!(1));
-        assert_eq!(json["method"], "initialize");
-        assert_eq!(json["params"]["foo"], "bar");
+    fn test_system_init_event() {
+        let json = r#"{"type":"system","subtype":"init","session_id":"abc-123","model":"claude-sonnet-4-20250514","tools":[]}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::System(sys) => {
+                assert_eq!(sys.subtype.as_deref(), Some("init"));
+                assert_eq!(sys.session_id.as_deref(), Some("abc-123"));
+                assert_eq!(sys.model.as_deref(), Some("claude-sonnet-4-20250514"));
+            }
+            _ => panic!("expected System event"),
+        }
     }
 
     #[test]
-    fn test_notification_omits_id_field() {
-        let req = Request::notification("initialized", json!({}));
-        let json = serde_json::to_value(&req).unwrap();
-
-        // id must be absent (skip_serializing_if = "Option::is_none")
-        assert!(!json.as_object().unwrap().contains_key("id"));
-        assert_eq!(json["method"], "initialized");
+    fn test_assistant_text_event() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}],"usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Assistant(evt) => {
+                assert_eq!(evt.message.content.len(), 1);
+                match &evt.message.content[0] {
+                    ContentBlock::Text { text } => assert_eq!(text, "Hello world"),
+                    _ => panic!("expected Text block"),
+                }
+                let usage = evt.message.usage.unwrap();
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.output_tokens, 50);
+            }
+            _ => panic!("expected Assistant event"),
+        }
     }
 
     #[test]
-    fn test_request_with_id_roundtrip_string() {
-        let req = Request::with_id(
-            42,
-            "thread/start",
-            json!({"approvalPolicy": "auto", "cwd": "/tmp"}),
-        );
-        let serialized = serde_json::to_string(&req).unwrap();
-        // Verify it is valid JSON and contains expected fields.
-        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(parsed["id"], 42);
-        assert_eq!(parsed["method"], "thread/start");
-        assert_eq!(parsed["params"]["approvalPolicy"], "auto");
+    fn test_assistant_tool_use_event() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/src/main.rs"},"id":"tu_1"}]}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Assistant(evt) => {
+                match &evt.message.content[0] {
+                    ContentBlock::ToolUse { name, input, id } => {
+                        assert_eq!(name, "Read");
+                        assert_eq!(input["file_path"], "/src/main.rs");
+                        assert_eq!(id.as_deref(), Some("tu_1"));
+                    }
+                    _ => panic!("expected ToolUse block"),
+                }
+            }
+            _ => panic!("expected Assistant event"),
+        }
     }
 
     #[test]
-    fn test_notification_method_is_set() {
-        let req = Request::notification("turn/cancel", json!({"threadId": "t1"}));
-        assert_eq!(req.method, "turn/cancel");
-        assert!(req.id.is_none());
-    }
-
-    // ---- Response deserialization ----------------------------------------- //
-
-    #[test]
-    fn test_response_deserializes_result() {
-        let raw = r#"{"id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
-        let resp: Response = serde_json::from_str(raw).unwrap();
-
-        assert_eq!(resp.id, Some(json!(1)));
-        assert!(resp.result.is_some());
-        assert!(resp.error.is_none());
-        assert!(resp.method.is_none());
-    }
-
-    #[test]
-    fn test_response_deserializes_error() {
-        let raw = r#"{"id":2,"error":{"code":-32600,"message":"Invalid Request"}}"#;
-        let resp: Response = serde_json::from_str(raw).unwrap();
-
-        assert!(resp.error.is_some());
-        assert!(resp.result.is_none());
+    fn test_result_success_event() {
+        let json = r#"{"type":"result","subtype":"success","result":"Task completed","duration_ms":4521,"num_turns":3,"total_cost_usd":0.0234,"usage":{"input_tokens":5000,"output_tokens":2000},"session_id":"abc-123"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Result(res) => {
+                assert_eq!(res.subtype.as_deref(), Some("success"));
+                assert_eq!(res.result.as_deref(), Some("Task completed"));
+                assert_eq!(res.duration_ms, Some(4521));
+                assert_eq!(res.num_turns, Some(3));
+                assert!((res.total_cost_usd.unwrap() - 0.0234).abs() < 0.0001);
+                let usage = res.usage.unwrap();
+                assert_eq!(usage.input_tokens, 5000);
+                assert_eq!(usage.output_tokens, 2000);
+            }
+            _ => panic!("expected Result event"),
+        }
     }
 
     #[test]
-    fn test_response_deserializes_event_notification() {
-        let raw = r#"{"method":"turn/completed","params":{"turnId":"t1"}}"#;
-        let resp: Response = serde_json::from_str(raw).unwrap();
-
-        assert_eq!(resp.method.as_deref(), Some("turn/completed"));
-        assert!(resp.params.is_some());
-        assert!(resp.id.is_none());
-    }
-
-    // ---- InitializeResult deserialization --------------------------------- //
-
-    #[test]
-    fn test_initialize_result_with_version() {
-        let raw = r#"{"protocol_version":"2024-11-05"}"#;
-        let res: InitializeResult = serde_json::from_str(raw).unwrap();
-        assert_eq!(res.protocol_version.as_deref(), Some("2024-11-05"));
+    fn test_result_error_event() {
+        let json = r#"{"type":"result","subtype":"error","result":"Something went wrong"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Result(res) => {
+                assert_eq!(res.subtype.as_deref(), Some("error"));
+            }
+            _ => panic!("expected Result event"),
+        }
     }
 
     #[test]
-    fn test_initialize_result_without_version() {
-        let raw = r#"{}"#;
-        let res: InitializeResult = serde_json::from_str(raw).unwrap();
-        assert!(res.protocol_version.is_none());
-    }
-
-    // ---- ThreadStartResult deserialization -------------------------------- //
-
-    #[test]
-    fn test_thread_start_result_deserializes() {
-        let raw = r#"{"thread":{"id":"thread-abc-123"}}"#;
-        let res: ThreadStartResult = serde_json::from_str(raw).unwrap();
-        assert_eq!(res.thread.id, "thread-abc-123");
+    fn test_rate_limit_event() {
+        let json = r#"{"type":"rate_limit_event","rate_limit_info":{"requests_remaining":10}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::RateLimitEvent(evt) => {
+                assert!(evt.rate_limit_info.is_some());
+            }
+            _ => panic!("expected RateLimitEvent"),
+        }
     }
 
     #[test]
-    fn test_thread_info_id() {
-        let info = ThreadInfo {
-            id: "my-thread".to_string(),
-        };
-        assert_eq!(info.id, "my-thread");
-    }
-
-    // ---- TurnStartResult deserialization ---------------------------------- //
-
-    #[test]
-    fn test_turn_start_result_deserializes() {
-        let raw = r#"{"turn":{"id":"turn-xyz-456"}}"#;
-        let res: TurnStartResult = serde_json::from_str(raw).unwrap();
-        assert_eq!(res.turn.id, "turn-xyz-456");
+    fn test_unknown_event_type() {
+        let json = r#"{"type":"some_future_event","data":"hello"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, StreamEvent::Unknown));
     }
 
     #[test]
-    fn test_turn_info_id() {
-        let info = TurnInfo {
-            id: "my-turn".to_string(),
-        };
-        assert_eq!(info.id, "my-turn");
-    }
-
-    // ---- Full initialize handshake simulation ----------------------------- //
-
-    #[test]
-    fn test_initialize_request_shape() {
-        let req = Request::with_id(
-            1,
-            "initialize",
-            json!({
-                "clientInfo": {"name": "symphony", "version": "1.0"},
-                "capabilities": {}
-            }),
-        );
-        let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v["id"], 1);
-        assert_eq!(v["method"], "initialize");
-        assert_eq!(v["params"]["clientInfo"]["name"], "symphony");
-        assert_eq!(v["params"]["clientInfo"]["version"], "1.0");
+    fn test_assistant_multiple_content_blocks() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me read that file"},{"type":"tool_use","name":"Read","input":{"file_path":"/src/lib.rs"}}]}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Assistant(evt) => {
+                assert_eq!(evt.message.content.len(), 2);
+                assert!(matches!(&evt.message.content[0], ContentBlock::Text { .. }));
+                assert!(matches!(&evt.message.content[1], ContentBlock::ToolUse { .. }));
+            }
+            _ => panic!("expected Assistant event"),
+        }
     }
 
     #[test]
-    fn test_initialized_notification_shape() {
-        let req = Request::notification("initialized", json!({}));
-        let v = serde_json::to_value(&req).unwrap();
-        assert!(!v.as_object().unwrap().contains_key("id"));
-        assert_eq!(v["method"], "initialized");
+    fn test_assistant_with_session_id() {
+        let json = r#"{"type":"assistant","message":{"content":[]},"session_id":"sess-42"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Assistant(evt) => {
+                assert_eq!(evt.session_id.as_deref(), Some("sess-42"));
+            }
+            _ => panic!("expected Assistant event"),
+        }
     }
 
     #[test]
-    fn test_thread_start_request_shape() {
-        let req = Request::with_id(
-            2,
-            "thread/start",
-            json!({
-                "approvalPolicy": "auto",
-                "sandbox": {},
-                "cwd": "/workspace/my-project"
-            }),
-        );
-        let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v["id"], 2);
-        assert_eq!(v["method"], "thread/start");
-        assert_eq!(v["params"]["approvalPolicy"], "auto");
-        assert_eq!(v["params"]["cwd"], "/workspace/my-project");
+    fn test_content_block_other_variant() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Assistant(evt) => {
+                assert_eq!(evt.message.content.len(), 1);
+                assert!(matches!(&evt.message.content[0], ContentBlock::Other));
+            }
+            _ => panic!("expected Assistant event"),
+        }
+    }
+
+    #[test]
+    fn test_usage_defaults_to_zero() {
+        let json = r#"{"input_tokens":0,"output_tokens":0}"#;
+        let usage: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
     }
 }

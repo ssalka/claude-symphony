@@ -230,6 +230,21 @@ pub enum AgentEvent {
     },
     /// A human-readable notification message from the agent.
     Notification { message: String },
+    /// Assistant text streamed from the Claude subprocess.
+    AssistantText { text: String },
+    /// Tool use event (start or result) from the Claude subprocess.
+    ToolEvent {
+        tool_name: String,
+        phase: String,
+        summary: String,
+    },
+    /// Turn result event from the Claude CLI.
+    TurnResult {
+        success: bool,
+        duration_ms: Option<u64>,
+        total_cost_usd: Option<f64>,
+        num_turns: Option<u32>,
+    },
     /// Any other raw message not matched by a known event type.
     OtherMessage { raw: String },
 }
@@ -318,6 +333,37 @@ mod tests {
             } => {
                 assert_eq!(input_tokens, 100);
                 assert_eq!(output_tokens, 200);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn test_agent_event_new_variants_clone() {
+        let text_ev = AgentEvent::AssistantText {
+            text: "Hello".to_string(),
+        };
+        let cloned = text_ev.clone();
+        match cloned {
+            AgentEvent::AssistantText { text } => assert_eq!(text, "Hello"),
+            _ => panic!("unexpected variant"),
+        }
+
+        let tool_ev = AgentEvent::ToolEvent {
+            tool_name: "Read".to_string(),
+            phase: "start".to_string(),
+            summary: "file_path: /src".to_string(),
+        };
+        let cloned = tool_ev.clone();
+        match cloned {
+            AgentEvent::ToolEvent {
+                tool_name,
+                phase,
+                summary,
+            } => {
+                assert_eq!(tool_name, "Read");
+                assert_eq!(phase, "start");
+                assert_eq!(summary, "file_path: /src");
             }
             _ => panic!("unexpected variant"),
         }
