@@ -1718,6 +1718,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
+ "libc",
  "liquid",
  "notify",
  "reqwest",
