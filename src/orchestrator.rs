@@ -703,7 +703,7 @@ impl Orchestrator {
 /// 1. Priority ascending (None last).
 /// 2. `created_at` oldest first (None last).
 /// 3. `identifier` lexicographic ascending.
-pub fn sort_candidates(issues: &mut Vec<Issue>) {
+pub fn sort_candidates(issues: &mut [Issue]) {
     issues.sort_by(|a, b| {
         // Priority: Some(low) < Some(high) < None.
         let pa = a.priority;

@@ -238,16 +238,14 @@ impl ClaudeSession {
         // Wait for the turn/start response (use a generous but finite timeout).
         // We reuse read_timeout_ms by reading directly; the caller controls the
         // outer turn timeout through run_turn.
-        let line = loop {
-            // We don't have access to read_timeout_ms here so use a fixed
-            // generous value of 30 seconds for the turn/start handshake.
-            match self.next_line(30_000).await? {
-                Some(l) => break l,
-                None => {
-                    return Err(Error::TurnFailed {
-                        message: "process exited during turn/start".to_string(),
-                    })
-                }
+        // We don't have access to read_timeout_ms here so use a fixed
+        // generous value of 30 seconds for the turn/start handshake.
+        let line = match self.next_line(30_000).await? {
+            Some(l) => l,
+            None => {
+                return Err(Error::TurnFailed {
+                    message: "process exited during turn/start".to_string(),
+                })
             }
         };
 
@@ -576,7 +574,7 @@ fn extract_usage(resp: &Response) -> Option<(u64, u64)> {
 
     // Try params.usage
     if let Some(p) = &resp.params {
-        if let Some(usage) = p.get("usage").and_then(|u| parse_usage(u)) {
+        if let Some(usage) = p.get("usage").and_then(parse_usage) {
             return Some(usage);
         }
         // Try direct fields on params
@@ -587,7 +585,7 @@ fn extract_usage(resp: &Response) -> Option<(u64, u64)> {
 
     // Try result.usage
     if let Some(r) = &resp.result {
-        if let Some(usage) = r.get("usage").and_then(|u| parse_usage(u)) {
+        if let Some(usage) = r.get("usage").and_then(parse_usage) {
             return Some(usage);
         }
         if let Some(usage) = parse_usage(r) {
