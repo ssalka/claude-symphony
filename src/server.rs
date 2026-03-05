@@ -143,6 +143,7 @@ mod tests {
             completed: HashSet::new(),
             claude_totals: ClaudeTotals::default(),
             claude_rate_limits: None,
+            next_dispatch_id: 1,
         }))
     }
 

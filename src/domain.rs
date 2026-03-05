@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 // -------------------------------------------------------------------------- //
 // Tracker types
@@ -76,10 +77,12 @@ pub struct RunningEntry {
     /// Snapshot of the issue at dispatch time.
     pub issue: Issue,
     pub attempt: u32,
+    /// Unique ID assigned at dispatch time; used to detect stale worker exits.
+    pub dispatch_id: u64,
     pub live_session: Option<LiveSession>,
     pub started_at: std::time::Instant,
-    /// Send `()` on this channel to request cancellation of the agent.
-    pub cancel_tx: tokio::sync::oneshot::Sender<()>,
+    /// Cancel this token to request cancellation of the agent.
+    pub cancel_token: CancellationToken,
 }
 
 /// Entry for an issue that is waiting to be retried after a failure.
@@ -141,7 +144,7 @@ pub struct OrchestratorSnapshot {
 /// Full runtime state of the orchestrator.
 ///
 /// Not directly serializable due to `RunningEntry` and `RetryEntry` containing
-/// `Instant`, `Sender`, and `JoinHandle`. Use [`OrchestratorSnapshot`] for
+/// `Instant`, `CancellationToken`, and `JoinHandle`. Use [`OrchestratorSnapshot`] for
 /// serialization (e.g., HTTP status responses).
 #[derive(Debug)]
 pub struct OrchestratorState {
@@ -153,6 +156,8 @@ pub struct OrchestratorState {
     pub completed: HashSet<String>,
     pub claude_totals: ClaudeTotals,
     pub claude_rate_limits: Option<serde_json::Value>,
+    /// Monotonically increasing counter; incremented each time a worker is dispatched.
+    pub next_dispatch_id: u64,
 }
 
 impl OrchestratorState {
@@ -269,6 +274,8 @@ pub enum WorkerEvent {
     /// The worker task has finished (success or failure).
     WorkerExited {
         issue_id: String,
+        /// The `dispatch_id` assigned when this worker was dispatched.
+        dispatch_id: u64,
         reason: WorkerExitReason,
     },
 }
@@ -443,6 +450,7 @@ mod tests {
             completed: HashSet::new(),
             claude_totals: ClaudeTotals::default(),
             claude_rate_limits: None,
+            next_dispatch_id: 1,
         };
 
         let snapshot = state.snapshot();

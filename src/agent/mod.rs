@@ -4,6 +4,7 @@ pub mod session;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ServiceConfig;
 use crate::domain::{AgentEvent, Issue, WorkerEvent, WorkflowDefinition};
@@ -43,13 +44,13 @@ impl AgentRunner {
     ///    [`AgentEvent`]s as [`WorkerEvent::ClaudeUpdate`] to the orchestrator.
     /// 5. Return `Ok(())` on successful completion or `Err(_)` on failure.
     ///
-    /// Cancellation is signalled via `cancel_rx`. When the oneshot fires the
+    /// Cancellation is signalled via `cancel_token`. When cancelled the
     /// current turn is interrupted and [`Error::TurnCancelled`] is returned.
     pub async fn run(
         self,
         issue: Issue,
         attempt: u32,
-        cancel_rx: tokio::sync::oneshot::Receiver<()>,
+        cancel_token: CancellationToken,
     ) -> Result<()> {
         // ---- 1. Create workspace ----------------------------------------- //
         let workspace = workspace::create_for_issue(&issue.identifier, &self.config).await?;
@@ -66,11 +67,11 @@ impl AgentRunner {
 
         let mut runner = ClaudeRunner::new(session_config);
 
-        // ---- 4. Convert the oneshot cancel into a watch so it can be
+        // ---- 4. Convert the CancellationToken into a watch so it can be
         //         observed across multiple turn iterations.                  //
         let (cancel_watch_tx, mut cancel_watch_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
-            let _ = cancel_rx.await;
+            cancel_token.cancelled().await;
             let _ = cancel_watch_tx.send(true);
         });
 
@@ -266,16 +267,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancellation_oneshot_fires_immediately() {
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    async fn test_cancellation_token_fires_immediately() {
+        let token = CancellationToken::new();
         let (watch_tx, mut watch_rx) = tokio::sync::watch::channel(false);
 
+        let token2 = token.clone();
         tokio::spawn(async move {
-            let _ = cancel_rx.await;
+            token2.cancelled().await;
             let _ = watch_tx.send(true);
         });
 
-        let _ = cancel_tx.send(());
+        token.cancel();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -316,13 +318,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<WorkerEvent>(8);
         tx.try_send(WorkerEvent::WorkerExited {
             issue_id: "issue-2".to_string(),
+            dispatch_id: 0,
             reason: WorkerExitReason::Normal,
         })
         .unwrap();
 
         let ev = rx.try_recv().unwrap();
         match ev {
-            WorkerEvent::WorkerExited { issue_id, reason } => {
+            WorkerEvent::WorkerExited { issue_id, reason, .. } => {
                 assert_eq!(issue_id, "issue-2");
                 assert!(matches!(reason, WorkerExitReason::Normal));
             }
@@ -335,6 +338,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<WorkerEvent>(8);
         tx.try_send(WorkerEvent::WorkerExited {
             issue_id: "issue-3".to_string(),
+            dispatch_id: 0,
             reason: WorkerExitReason::Abnormal {
                 error: "timeout".to_string(),
             },
@@ -343,7 +347,7 @@ mod tests {
 
         let ev = rx.try_recv().unwrap();
         match ev {
-            WorkerEvent::WorkerExited { issue_id, reason } => {
+            WorkerEvent::WorkerExited { issue_id, reason, .. } => {
                 assert_eq!(issue_id, "issue-3");
                 match reason {
                     WorkerExitReason::Abnormal { error } => {
