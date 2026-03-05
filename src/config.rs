@@ -293,6 +293,11 @@ impl ServiceConfig {
                 command: String::new(),
             });
         }
+        if self.active_states.is_empty() {
+            return Err(Error::ConfigValidation {
+                message: "orchestrator.active_states is empty; no issues will be fetched".into(),
+            });
+        }
         Ok(())
     }
 }
@@ -319,6 +324,11 @@ workspace:
 
 agent:
   command: claude
+
+orchestrator:
+  active_states:
+    - in progress
+    - todo
 "#
         ))
         .unwrap()
@@ -649,6 +659,26 @@ agent:
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
         let err = cfg.validate_for_dispatch().unwrap_err();
         assert!(matches!(err, crate::error::Error::ClaudeNotFound { .. }));
+    }
+
+    #[test]
+    fn test_validate_for_dispatch_empty_active_states() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+tracker:
+  kind: linear
+  api_key: k
+  project_slug: p
+workspace:
+  root: /tmp
+agent:
+  command: claude
+"#,
+        )
+        .unwrap();
+        let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
+        let err = cfg.validate_for_dispatch().unwrap_err();
+        assert!(matches!(err, crate::error::Error::ConfigValidation { .. }));
     }
 
     // ---- optional fields ----------------------------------------------------

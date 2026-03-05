@@ -101,6 +101,13 @@ pub enum Error {
     HookTimeout { timeout_ms: u64 },
 
     // ------------------------------------------------------------------ //
+    // Config validation errors
+    // ------------------------------------------------------------------ //
+    /// A configuration value failed validation.
+    #[error("config validation error: {message}")]
+    ConfigValidation { message: String },
+
+    // ------------------------------------------------------------------ //
     // Agent errors
     // ------------------------------------------------------------------ //
     /// The `claude` executable was not found on `PATH` (or the configured
@@ -310,6 +317,16 @@ mod tests {
     fn test_hook_timeout() {
         let err = Error::HookTimeout { timeout_ms: 30_000 };
         assert_display(&err, "hook script timed out after 30000ms");
+    }
+
+    // ---- config validation errors ----------------------------------------- //
+
+    #[test]
+    fn test_config_validation() {
+        let err = Error::ConfigValidation {
+            message: "active_states is empty".to_string(),
+        };
+        assert_display(&err, "config validation error: active_states is empty");
     }
 
     // ---- agent errors ----------------------------------------------------- //

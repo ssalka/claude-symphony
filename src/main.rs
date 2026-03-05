@@ -65,8 +65,8 @@ async fn main() -> anyhow::Result<()> {
     // 1. Init tracing subscriber (env-filter)
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("symphony=info".parse()?),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "symphony=info".parse().unwrap()),
         )
         .init();
 
@@ -90,6 +90,14 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. Parse config to get tracker settings
     let config = ServiceConfig::from_yaml(&initial_workflow.config)?;
+
+    tracing::info!(
+        project_slug = %config.tracker_project_slug,
+        active_states = ?config.active_states,
+        poll_interval_ms = config.poll_interval_ms,
+        max_concurrent = config.max_concurrent_agents,
+        "Symphony started"
+    );
 
     // 6. Create tracker
     let tracker = Arc::new(LinearClient::new(

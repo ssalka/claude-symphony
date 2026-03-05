@@ -102,6 +102,7 @@ impl Orchestrator {
                     }
                     state.completed.insert(issue.id.clone());
                 }
+                tracing::info!("Startup cleanup complete");
             }
             Err(e) => {
                 tracing::warn!(error = %e, "startup cleanup: fetch terminal issues failed (ignored)");
@@ -116,6 +117,8 @@ impl Orchestrator {
     /// Run the orchestrator forever (until the process is killed).
     pub async fn run(mut self) {
         loop {
+            tracing::debug!("Poll tick starting");
+
             // 1. Drain incoming WorkerEvents.
             self.process_events().await;
 
@@ -150,7 +153,10 @@ impl Orchestrator {
                     .fetch_candidate_issues(&config.active_states, &config.tracker_project_slug)
                     .await
                 {
-                    Ok(c) => c,
+                    Ok(c) => {
+                        tracing::info!(count = c.len(), "Fetched candidate issues");
+                        c
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "Fetch candidates failed; sleeping until next tick");
                         let interval = config.poll_interval_ms;

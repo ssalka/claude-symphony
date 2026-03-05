@@ -50,8 +50,9 @@ query FetchCandidates($projectSlug: String!, $states: [String!]!, $after: String
       branchName
       url
       labels { nodes { name } }
-      relations(filter: { type: { eq: "blocked_by" } }) {
+      relations {
         nodes {
+          type
           relatedIssue {
             id
             identifier
@@ -122,6 +123,8 @@ struct RawRelatedIssue {
 
 #[derive(Debug, serde::Deserialize)]
 struct RawRelationNode {
+    #[serde(rename = "type")]
+    relation_type: Option<String>,
     #[serde(rename = "relatedIssue")]
     related_issue: Option<RawRelatedIssue>,
 }
@@ -281,6 +284,9 @@ impl LinearClient {
             .map(|r| {
                 r.nodes
                     .into_iter()
+                    .filter(|rn| {
+                        rn.relation_type.as_deref() == Some("blocked_by")
+                    })
                     .filter_map(|rn| rn.related_issue)
                     .map(|ri| BlockerRef {
                         id: ri.id,
@@ -511,6 +517,7 @@ mod tests {
                 nodes: relations
                     .into_iter()
                     .map(|(id, ident, state)| RawRelationNode {
+                        relation_type: Some("blocked_by".to_string()),
                         related_issue: Some(RawRelatedIssue {
                             id: Some(id.to_string()),
                             identifier: Some(ident.to_string()),
@@ -584,6 +591,7 @@ mod tests {
         let mut node = make_raw_node(vec![], vec![]);
         node.relations = Some(RawRelations {
             nodes: vec![RawRelationNode {
+                relation_type: Some("blocked_by".to_string()),
                 related_issue: None,
             }],
         });
