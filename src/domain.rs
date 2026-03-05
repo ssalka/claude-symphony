@@ -210,6 +210,7 @@ impl OrchestratorState {
 // -------------------------------------------------------------------------- //
 
 /// Parsed workflow file: YAML front-matter config and the Liquid prompt template.
+#[derive(Debug)]
 pub struct WorkflowDefinition {
     pub config: serde_yaml::Value,
     pub prompt_template: String,
