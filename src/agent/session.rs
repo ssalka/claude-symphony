@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use std::process::Stdio;
 
-use crate::domain::AgentEvent;
+use crate::domain::{truncate, AgentEvent};
 use crate::error::{Error, Result};
 
 use super::protocol::{ContentBlock, StreamEvent};
@@ -141,7 +141,7 @@ impl ClaudeRunner {
 
         // Ensure the process is killed if it's still running.
         if result.is_err() {
-            stop_process(&mut process);
+            stop_process(&mut process).await;
         }
 
         result
@@ -167,7 +167,7 @@ impl ClaudeRunner {
                 result = tokio::time::timeout(remaining, lines.next()) => {
                     match result {
                         Err(_elapsed) => {
-                            stop_process(process);
+                            stop_process(process).await;
                             return Err(Error::TurnTimeout);
                         }
                         Ok(None) => {
@@ -186,7 +186,7 @@ impl ClaudeRunner {
                 }
                 _ = cancel.changed() => {
                     if *cancel.borrow() {
-                        stop_process(process);
+                        stop_process(process).await;
                         return Err(Error::TurnCancelled);
                     }
                     continue;
@@ -308,20 +308,22 @@ impl ClaudeRunner {
 // -------------------------------------------------------------------------- //
 
 /// Send SIGTERM to the process, wait briefly, then SIGKILL if still running.
-fn stop_process(process: &mut Child) {
+async fn stop_process(process: &mut Child) {
     if let Some(pid) = process.id() {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
 
-        let start = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
         loop {
-            if start.elapsed().as_secs() >= 2 {
-                break;
-            }
             match process.try_wait() {
                 Ok(Some(_)) => return,
-                _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+                _ => {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
             }
         }
     }
@@ -329,16 +331,6 @@ fn stop_process(process: &mut Child) {
     let _ = process.start_kill();
 }
 
-/// Truncate a string to `max_len` characters, appending "…" if truncated.
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        let mut result = s[..max_len].to_string();
-        result.push('…');
-        result
-    }
-}
 
 // -------------------------------------------------------------------------- //
 // Unit tests
@@ -371,22 +363,4 @@ mod tests {
         assert_eq!(cloned.turn_timeout_ms, 600_000);
     }
 
-    #[test]
-    fn test_truncate_short_string() {
-        assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn test_truncate_long_string() {
-        let long = "a".repeat(20);
-        let result = truncate(&long, 10);
-        assert_eq!(result.len(), 10 + 3); // 10 ASCII chars + 3-byte '…'
-        assert!(result.ends_with('…'));
-    }
-
-    #[test]
-    fn test_truncate_exact_length() {
-        let s = "a".repeat(10);
-        assert_eq!(truncate(&s, 10), s);
-    }
 }

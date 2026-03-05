@@ -6,8 +6,8 @@ use tokio::time::sleep;
 use crate::agent::AgentRunner;
 use crate::config::ServiceConfig;
 use crate::domain::{
-    AgentEvent, Issue, LiveSession, OrchestratorState, RetryEntry, RunningEntry, WorkerEvent,
-    WorkerExitReason, WorkflowDefinition,
+    truncate, AgentEvent, Issue, LiveSession, OrchestratorState, RetryEntry, RunningEntry,
+    WorkerEvent, WorkerExitReason, WorkflowDefinition,
 };
 use crate::tracker::Tracker;
 use crate::workspace;
@@ -500,28 +500,25 @@ impl Orchestrator {
     /// Handle a `ClaudeUpdate` event: update token totals and live session data.
     async fn handle_claude_update(&mut self, issue_id: &str, event: AgentEvent) {
         let mut state = self.state.lock().await;
-        match event {
+
+        let identifier = state
+            .running
+            .get(issue_id)
+            .map(|e| e.issue.identifier.clone())
+            .unwrap_or_else(|| issue_id.to_string());
+
+        // Determine the event name and message for live session update, plus
+        // any arm-specific side effects.
+        let (event_name, event_message) = match event {
             AgentEvent::UsageUpdate {
                 input_tokens,
                 output_tokens,
             } => {
                 if let Some(entry) = state.running.get_mut(issue_id) {
-                    let ls = entry.live_session.get_or_insert_with(|| LiveSession {
-                        session_id: String::new(),
-                        thread_id: String::new(),
-                        turn_id: String::new(),
-                        pid: 0,
-                        last_event: None,
-                        last_event_timestamp: None,
-                        last_event_message: None,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        last_reported_input_tokens: 0,
-                        last_reported_output_tokens: 0,
-                        turn_count: 0,
-                    });
+                    let ls = entry
+                        .live_session
+                        .get_or_insert_with(LiveSession::default);
 
-                    // Compute deltas vs last reported values.
                     let delta_in = input_tokens.saturating_sub(ls.last_reported_input_tokens);
                     let delta_out = output_tokens.saturating_sub(ls.last_reported_output_tokens);
 
@@ -529,70 +526,34 @@ impl Orchestrator {
                     ls.output_tokens = output_tokens;
                     ls.last_reported_input_tokens = input_tokens;
                     ls.last_reported_output_tokens = output_tokens;
-                    ls.last_event = Some("usage_update".to_string());
-                    ls.last_event_timestamp = Some(chrono::Utc::now());
 
                     state.claude_totals.input_tokens += delta_in;
                     state.claude_totals.output_tokens += delta_out;
                     state.claude_totals.total_tokens += delta_in + delta_out;
                 }
+                ("usage_update".to_string(), None)
             }
             AgentEvent::Notification { message } => {
+                // Ensure live session exists for notification events.
                 if let Some(entry) = state.running.get_mut(issue_id) {
-                    let ls = entry.live_session.get_or_insert_with(|| LiveSession {
-                        session_id: String::new(),
-                        thread_id: String::new(),
-                        turn_id: String::new(),
-                        pid: 0,
-                        last_event: None,
-                        last_event_timestamp: None,
-                        last_event_message: None,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        last_reported_input_tokens: 0,
-                        last_reported_output_tokens: 0,
-                        turn_count: 0,
-                    });
-                    ls.last_event = Some("notification".to_string());
-                    ls.last_event_timestamp = Some(chrono::Utc::now());
-                    ls.last_event_message = Some(message.clone());
+                    entry
+                        .live_session
+                        .get_or_insert_with(LiveSession::default);
                 }
                 tracing::info!(issue_id = %issue_id, message = %message, "Agent notification");
+                ("notification".to_string(), Some(message))
             }
             AgentEvent::AssistantText { text } => {
-                let identifier = state
-                    .running
-                    .get(issue_id)
-                    .map(|e| e.issue.identifier.as_str())
-                    .unwrap_or(issue_id);
                 tracing::info!("[{identifier}] {text}");
-                if let Some(entry) = state.running.get_mut(issue_id) {
-                    if let Some(ref mut ls) = entry.live_session {
-                        ls.last_event = Some("assistant_text".to_string());
-                        ls.last_event_timestamp = Some(chrono::Utc::now());
-                        ls.last_event_message = Some(text);
-                    }
-                }
+                ("assistant_text".to_string(), Some(text))
             }
             AgentEvent::ToolEvent {
                 tool_name,
                 phase,
                 summary,
             } => {
-                let identifier = state
-                    .running
-                    .get(issue_id)
-                    .map(|e| e.issue.identifier.as_str())
-                    .unwrap_or(issue_id);
                 tracing::info!("[{identifier}] Tool {phase}: {tool_name} | {summary}");
-                if let Some(entry) = state.running.get_mut(issue_id) {
-                    if let Some(ref mut ls) = entry.live_session {
-                        ls.last_event = Some(format!("tool_{phase}"));
-                        ls.last_event_timestamp = Some(chrono::Utc::now());
-                        ls.last_event_message =
-                            Some(format!("{tool_name}: {summary}"));
-                    }
-                }
+                (format!("tool_{phase}"), Some(format!("{tool_name}: {summary}")))
             }
             AgentEvent::TurnResult {
                 success,
@@ -600,47 +561,34 @@ impl Orchestrator {
                 total_cost_usd,
                 ..
             } => {
-                let identifier = state
-                    .running
-                    .get(issue_id)
-                    .map(|e| e.issue.identifier.as_str())
-                    .unwrap_or(issue_id);
                 tracing::info!(
                     "[{identifier}] Turn {}: {}ms, ${:.4}",
                     if success { "completed" } else { "failed" },
                     duration_ms.unwrap_or(0),
                     total_cost_usd.unwrap_or(0.0)
                 );
-                if let Some(entry) = state.running.get_mut(issue_id) {
-                    if let Some(ref mut ls) = entry.live_session {
-                        ls.last_event = Some("turn_result".to_string());
-                        ls.last_event_timestamp = Some(chrono::Utc::now());
-                        ls.last_event_message = Some(format!(
-                            "{}; {}ms; ${:.4}",
-                            if success { "success" } else { "failed" },
-                            duration_ms.unwrap_or(0),
-                            total_cost_usd.unwrap_or(0.0)
-                        ));
-                    }
-                }
+                let msg = format!(
+                    "{}; {}ms; ${:.4}",
+                    if success { "success" } else { "failed" },
+                    duration_ms.unwrap_or(0),
+                    total_cost_usd.unwrap_or(0.0)
+                );
+                ("turn_result".to_string(), Some(msg))
             }
             AgentEvent::OtherMessage { raw } => {
-                let identifier = state
-                    .running
-                    .get(issue_id)
-                    .map(|e| e.issue.identifier.as_str())
-                    .unwrap_or(issue_id);
-                let msg = if raw.len() > 120 {
-                    format!("{}…", &raw[..120])
-                } else {
-                    raw.clone()
-                };
+                let msg = truncate(&raw, 120);
                 tracing::info!("[{identifier}] {msg}");
-                if let Some(entry) = state.running.get_mut(issue_id) {
-                    if let Some(ref mut ls) = entry.live_session {
-                        ls.last_event = Some("other".to_string());
-                        ls.last_event_timestamp = Some(chrono::Utc::now());
-                    }
+                ("other".to_string(), None)
+            }
+        };
+
+        // Update live session fields.
+        if let Some(entry) = state.running.get_mut(issue_id) {
+            if let Some(ref mut ls) = entry.live_session {
+                ls.last_event = Some(event_name);
+                ls.last_event_timestamp = Some(chrono::Utc::now());
+                if event_message.is_some() {
+                    ls.last_event_message = event_message;
                 }
             }
         }

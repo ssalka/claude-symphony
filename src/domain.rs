@@ -35,7 +35,7 @@ pub struct Issue {
 // -------------------------------------------------------------------------- //
 
 /// Tracks the real-time state of an active Claude agent session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LiveSession {
     pub session_id: String,
     pub thread_id: String,
@@ -274,6 +274,23 @@ pub enum WorkerEvent {
 }
 
 // -------------------------------------------------------------------------- //
+// Shared helpers
+// -------------------------------------------------------------------------- //
+
+/// Truncate a string to at most `max_len` bytes at a valid UTF-8 boundary,
+/// appending "…" if truncated.
+pub fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let end = s.floor_char_boundary(max_len);
+        let mut result = s[..end].to_string();
+        result.push('…');
+        result
+    }
+}
+
+// -------------------------------------------------------------------------- //
 // Unit tests
 // -------------------------------------------------------------------------- //
 
@@ -376,6 +393,43 @@ mod tests {
         };
         let dbg = format!("{:?}", reason);
         assert!(dbg.contains("timeout"));
+    }
+
+    #[test]
+    fn test_truncate_short_string() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_long_string() {
+        let long = "a".repeat(20);
+        let result = truncate(&long, 10);
+        assert!(result.starts_with("aaaaaaaaaa"));
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn test_truncate_exact_length() {
+        let s = "a".repeat(10);
+        assert_eq!(truncate(&s, 10), s);
+    }
+
+    #[test]
+    fn test_truncate_multibyte_boundary() {
+        // "héllo" — 'é' is 2 bytes, so cutting at byte 2 would split it.
+        let s = "héllo";
+        let result = truncate(s, 2);
+        // Should not panic; should cut before the multibyte char if needed.
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn test_live_session_default() {
+        let ls = LiveSession::default();
+        assert_eq!(ls.session_id, "");
+        assert_eq!(ls.pid, 0);
+        assert_eq!(ls.input_tokens, 0);
+        assert!(ls.last_event.is_none());
     }
 
     #[test]
