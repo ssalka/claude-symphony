@@ -5,6 +5,8 @@ use tokio::time::sleep;
 
 use crate::agent::AgentRunner;
 use crate::config::ServiceConfig;
+use tokio_util::sync::CancellationToken;
+
 use crate::domain::{
     truncate, AgentEvent, Issue, LiveSession, OrchestratorState, RetryEntry, RunningEntry,
     WorkerEvent, WorkerExitReason, WorkflowDefinition,
@@ -63,6 +65,7 @@ impl Orchestrator {
             completed: std::collections::HashSet::new(),
             claude_totals: crate::domain::ClaudeTotals::default(),
             claude_rate_limits: None,
+            next_dispatch_id: 1,
         };
 
         Self {
@@ -91,9 +94,7 @@ impl Orchestrator {
                 let mut state = self.state.lock().await;
                 for issue in issues {
                     // Best-effort workspace cleanup.
-                    if let Err(e) =
-                        workspace::cleanup_workspace(&issue.identifier, config).await
-                    {
+                    if let Err(e) = workspace::cleanup_workspace(&issue.identifier, config).await {
                         tracing::warn!(
                             identifier = %issue.identifier,
                             error = %e,
@@ -150,7 +151,10 @@ impl Orchestrator {
                 // 5. Fetch candidates.
                 let mut candidates = match self
                     .tracker
-                    .fetch_candidate_issues(&config.active_states_original, &config.tracker_project_slug)
+                    .fetch_candidate_issues(
+                        &config.active_states_original,
+                        &config.tracker_project_slug,
+                    )
                     .await
                 {
                     Ok(c) => {
@@ -213,9 +217,7 @@ impl Orchestrator {
                 let stall_elapsed_ms = if let Some(ref ls) = entry.live_session {
                     if let Some(ts) = ls.last_event_timestamp {
                         let now = chrono::Utc::now();
-                        now.signed_duration_since(ts)
-                            .num_milliseconds()
-                            .max(0) as u64
+                        now.signed_duration_since(ts).num_milliseconds().max(0) as u64
                     } else {
                         elapsed_ms
                     }
@@ -231,12 +233,12 @@ impl Orchestrator {
                         identifier = %entry.issue.identifier,
                         elapsed_ms = stall_elapsed_ms,
                         stall_timeout_ms = config.agent_stall_timeout_ms,
-                        "Agent appears stalled (cancel_tx ownership prevents hard kill here; \
-                         worker's own turn_timeout_ms will eventually fire)"
+                        "Agent appears stalled; cancelling"
                     );
-                    // TODO: To actually cancel from here, RunningEntry.cancel_tx
-                    // needs to be Option<oneshot::Sender<()>> so we can .take() it.
-                    // Currently domain.rs defines it as a plain oneshot::Sender.
+                    // CancellationToken::cancel() takes &self, so we can call it
+                    // without removing the entry. The worker will exit and
+                    // handle_worker_exit will clean up and schedule a retry.
+                    entry.cancel_token.cancel();
                 }
             }
         }
@@ -302,8 +304,8 @@ impl Orchestrator {
                             state = %entry.issue.state,
                             "Reconcile: cancelling running agent (issue reached terminal/unknown state)"
                         );
-                        // Consume cancel_tx to signal cancellation.
-                        let _ = entry.cancel_tx.send(());
+                        // Signal cancellation.
+                        entry.cancel_token.cancel();
 
                         let mut state = self.state.lock().await;
                         state.completed.insert(id.clone());
@@ -397,23 +399,30 @@ impl Orchestrator {
         let issue_id = issue.id.clone();
         let issue_identifier = issue.identifier.clone();
 
-        // Create cancel channel.
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        // Create cancellation token.
+        let cancel_token = CancellationToken::new();
 
-        let attempt = self.get_attempt(&issue_id).await;
-
-        // Create RunningEntry.
-        let entry = RunningEntry {
-            issue: issue.clone(),
-            attempt,
-            live_session: None,
-            started_at: std::time::Instant::now(),
-            cancel_tx,
-        };
-
-        // Update state.
-        {
+        // Get attempt and assign dispatch_id under a single lock.
+        let (attempt, dispatch_id) = {
             let mut state = self.state.lock().await;
+            let attempt = state
+                .retry_attempts
+                .get(&issue_id)
+                .map(|r| r.attempt)
+                .unwrap_or(1);
+            state.next_dispatch_id += 1;
+            let dispatch_id = state.next_dispatch_id;
+
+            // Create RunningEntry.
+            let entry = RunningEntry {
+                issue: issue.clone(),
+                attempt,
+                dispatch_id,
+                live_session: None,
+                started_at: std::time::Instant::now(),
+                cancel_token: cancel_token.clone(),
+            };
+
             state.running.insert(issue_id.clone(), entry);
             state.claimed.insert(issue_id.clone());
 
@@ -421,12 +430,15 @@ impl Orchestrator {
             if let Some(retry) = state.retry_attempts.remove(&issue_id) {
                 retry.abort_handle.abort();
             }
-        }
+
+            (attempt, dispatch_id)
+        };
 
         tracing::info!(
             issue_id = %issue_id,
             identifier = %issue_identifier,
             attempt = attempt,
+            dispatch_id = dispatch_id,
             "Dispatching worker"
         );
 
@@ -440,7 +452,7 @@ impl Orchestrator {
         let event_tx = self.event_tx.clone();
 
         tokio::spawn(async move {
-            let result = runner.run(issue, attempt, cancel_rx).await;
+            let result = runner.run(issue, attempt, cancel_token).await;
             let reason = match result {
                 Ok(()) => WorkerExitReason::Normal,
                 Err(e) => WorkerExitReason::Abnormal {
@@ -450,21 +462,11 @@ impl Orchestrator {
             let _ = event_tx
                 .send(WorkerEvent::WorkerExited {
                     issue_id: issue_id_clone,
+                    dispatch_id,
                     reason,
                 })
                 .await;
         });
-    }
-
-    /// Return the attempt number for `issue_id`: uses retry_attempts entry if
-    /// present, otherwise 1.
-    async fn get_attempt(&self, issue_id: &str) -> u32 {
-        let state = self.state.lock().await;
-        state
-            .retry_attempts
-            .get(issue_id)
-            .map(|r| r.attempt)
-            .unwrap_or(1)
     }
 
     // ---------------------------------------------------------------------- //
@@ -478,7 +480,11 @@ impl Orchestrator {
                 WorkerEvent::ClaudeUpdate { issue_id, event } => {
                     self.handle_claude_update(&issue_id, event).await;
                 }
-                WorkerEvent::WorkerExited { issue_id, reason } => {
+                WorkerEvent::WorkerExited {
+                    issue_id,
+                    dispatch_id,
+                    reason,
+                } => {
                     // We need config for backoff calculation. Try to parse it;
                     // fall back to a sensible default if parsing fails.
                     let max_backoff = {
@@ -487,7 +493,8 @@ impl Orchestrator {
                             .map(|c| c.agent_max_retry_backoff_ms)
                             .unwrap_or(300_000)
                     };
-                    self.handle_worker_exit(&issue_id, reason, max_backoff).await;
+                    self.handle_worker_exit(&issue_id, dispatch_id, reason, max_backoff)
+                        .await;
                 }
             }
         }
@@ -515,9 +522,7 @@ impl Orchestrator {
                 output_tokens,
             } => {
                 if let Some(entry) = state.running.get_mut(issue_id) {
-                    let ls = entry
-                        .live_session
-                        .get_or_insert_with(LiveSession::default);
+                    let ls = entry.live_session.get_or_insert_with(LiveSession::default);
 
                     let delta_in = input_tokens.saturating_sub(ls.last_reported_input_tokens);
                     let delta_out = output_tokens.saturating_sub(ls.last_reported_output_tokens);
@@ -536,9 +541,7 @@ impl Orchestrator {
             AgentEvent::Notification { message } => {
                 // Ensure live session exists for notification events.
                 if let Some(entry) = state.running.get_mut(issue_id) {
-                    entry
-                        .live_session
-                        .get_or_insert_with(LiveSession::default);
+                    entry.live_session.get_or_insert_with(LiveSession::default);
                 }
                 tracing::trace!(issue_id = %issue_id, message = %message, "Agent notification");
                 ("notification".to_string(), Some(message))
@@ -553,7 +556,10 @@ impl Orchestrator {
                 summary,
             } => {
                 tracing::trace!("[{identifier}] Tool {phase}: {tool_name} | {summary}");
-                (format!("tool_{phase}"), Some(format!("{tool_name}: {summary}")))
+                (
+                    format!("tool_{phase}"),
+                    Some(format!("{tool_name}: {summary}")),
+                )
             }
             AgentEvent::TurnResult {
                 success,
@@ -603,11 +609,24 @@ impl Orchestrator {
     async fn handle_worker_exit(
         &mut self,
         issue_id: &str,
+        dispatch_id: u64,
         reason: WorkerExitReason,
         max_backoff_ms: u64,
     ) {
         let (attempt, identifier, elapsed_secs) = {
             let mut state = self.state.lock().await;
+
+            // Ignore exits from stale workers (e.g. old worker cancelled by
+            // reconcile when the issue was immediately re-dispatched).
+            if state.running.get(issue_id).map(|e| e.dispatch_id) != Some(dispatch_id) {
+                tracing::warn!(
+                    issue_id = %issue_id,
+                    dispatch_id = dispatch_id,
+                    "Ignoring stale worker exit"
+                );
+                return;
+            }
+
             let entry = state.running.remove(issue_id);
 
             let elapsed = entry
@@ -682,8 +701,10 @@ impl Orchestrator {
         let handle = tokio::spawn(async move {
             sleep(delay).await;
             let mut state = state_clone.lock().await;
+            // Only remove `claimed` here; `retry_attempts` is removed by
+            // `dispatch()` when it actually picks up the issue, preserving
+            // the `attempt` counter across the retry timer.
             state.claimed.remove(&issue_id_owned);
-            state.retry_attempts.remove(&issue_id_owned);
         });
 
         let due_at_ms = std::time::SystemTime::now()
@@ -778,6 +799,7 @@ mod tests {
     use super::*;
     use crate::domain::BlockerRef;
     use chrono::TimeZone;
+    use tokio_util::sync::CancellationToken;
 
     // ---------------------------------------------------------------------- //
     // Helpers
@@ -1003,11 +1025,10 @@ mod tests {
             }
         }
 
-        let (config_tx, config_rx) =
-            tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
-                config: serde_yaml::Value::Null,
-                prompt_template: String::new(),
-            }));
+        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
+            config: serde_yaml::Value::Null,
+            prompt_template: String::new(),
+        }));
         let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         // Keep sender alive to prevent watch from closing.
@@ -1081,16 +1102,16 @@ mod tests {
 
         // Insert a fake running entry.
         {
-            let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
             let mut state = orch.state.lock().await;
             state.running.insert(
                 "id-1".to_string(),
                 RunningEntry {
                     issue: make_issue("id-1", "ENG-1", "In Progress"),
                     attempt: 1,
+                    dispatch_id: 1,
                     live_session: None,
                     started_at: std::time::Instant::now(),
-                    cancel_tx,
+                    cancel_token: CancellationToken::new(),
                 },
             );
         }
@@ -1121,16 +1142,16 @@ mod tests {
 
         // Insert one running entry to saturate the limit.
         {
-            let (cancel_tx, _) = tokio::sync::oneshot::channel::<()>();
             let mut state = orch.state.lock().await;
             state.running.insert(
                 "other-id".to_string(),
                 RunningEntry {
                     issue: make_issue("other-id", "ENG-0", "In Progress"),
                     attempt: 1,
+                    dispatch_id: 1,
                     live_session: None,
                     started_at: std::time::Instant::now(),
-                    cancel_tx,
+                    cancel_token: CancellationToken::new(),
                 },
             );
         }
@@ -1149,16 +1170,16 @@ mod tests {
 
         // Insert one running entry in "In Progress".
         {
-            let (cancel_tx, _) = tokio::sync::oneshot::channel::<()>();
             let mut state = orch.state.lock().await;
             state.running.insert(
                 "other-id".to_string(),
                 RunningEntry {
                     issue: make_issue("other-id", "ENG-0", "In Progress"),
                     attempt: 1,
+                    dispatch_id: 1,
                     live_session: None,
                     started_at: std::time::Instant::now(),
-                    cancel_tx,
+                    cancel_token: CancellationToken::new(),
                 },
             );
         }

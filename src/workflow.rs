@@ -113,20 +113,16 @@ impl WorkflowLoader {
         std::thread::spawn(move || {
             let (fs_tx, fs_rx) = std::sync::mpsc::channel();
 
-            let mut watcher =
-                match RecommendedWatcher::new(fs_tx, NotifyConfig::default()) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::error!("failed to create file watcher: {e}");
-                        return;
-                    }
-                };
+            let mut watcher = match RecommendedWatcher::new(fs_tx, NotifyConfig::default()) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("failed to create file watcher: {e}");
+                    return;
+                }
+            };
 
             if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                tracing::error!(
-                    "failed to watch workflow file {}: {e}",
-                    path.display()
-                );
+                tracing::error!("failed to watch workflow file {}: {e}", path.display());
                 return;
             }
 
@@ -250,10 +246,7 @@ This is the prompt for {{ issue.title }}.
     fn test_config_fields_accessible() {
         let def = parse_workflow_file(valid_content()).unwrap();
         let tracker = def.config.get("tracker").unwrap();
-        assert_eq!(
-            tracker.get("kind").and_then(|v| v.as_str()),
-            Some("linear")
-        );
+        assert_eq!(tracker.get("kind").and_then(|v| v.as_str()), Some("linear"));
         assert_eq!(
             tracker.get("api_key").and_then(|v| v.as_str()),
             Some("my-key")

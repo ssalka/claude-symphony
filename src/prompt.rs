@@ -44,10 +44,7 @@ fn opt_i64_value(opt: Option<i64>) -> Value {
 /// Build the liquid `Value::Object` for a single [`BlockerRef`].
 fn blocker_to_value(b: &BlockerRef) -> Value {
     let mut obj = liquid::Object::new();
-    obj.insert(
-        KString::from_static("id"),
-        opt_str_value(b.id.as_deref()),
-    );
+    obj.insert(KString::from_static("id"), opt_str_value(b.id.as_deref()));
     obj.insert(
         KString::from_static("identifier"),
         opt_str_value(b.identifier.as_deref()),
@@ -73,11 +70,12 @@ fn blocker_to_value(b: &BlockerRef) -> Value {
 ///   filter was applied to an incompatible type).
 pub fn render_prompt(template: &str, issue: &Issue, attempt: Option<u32>) -> Result<String> {
     // Build a parser with the full Liquid standard library.
-    let parser = liquid::ParserBuilder::with_stdlib()
-        .build()
-        .map_err(|e| Error::TemplateParseError {
-            message: e.to_string(),
-        })?;
+    let parser =
+        liquid::ParserBuilder::with_stdlib()
+            .build()
+            .map_err(|e| Error::TemplateParseError {
+                message: e.to_string(),
+            })?;
 
     // Compile the template.
     let tmpl = parser
@@ -92,10 +90,7 @@ pub fn render_prompt(template: &str, issue: &Issue, attempt: Option<u32>) -> Res
     let mut globals = liquid::Object::new();
 
     // --- scalar fields ---
-    globals.insert(
-        KString::from_static("id"),
-        Value::scalar(issue.id.clone()),
-    );
+    globals.insert(KString::from_static("id"), Value::scalar(issue.id.clone()));
     globals.insert(
         KString::from_static("identifier"),
         Value::scalar(issue.identifier.clone()),
@@ -106,13 +101,7 @@ pub fn render_prompt(template: &str, issue: &Issue, attempt: Option<u32>) -> Res
     );
     globals.insert(
         KString::from_static("description"),
-        Value::scalar(
-            issue
-                .description
-                .as_deref()
-                .unwrap_or("")
-                .to_owned(),
-        ),
+        Value::scalar(issue.description.as_deref().unwrap_or("").to_owned()),
     );
     globals.insert(
         KString::from_static("priority"),
@@ -141,25 +130,16 @@ pub fn render_prompt(template: &str, issue: &Issue, attempt: Option<u32>) -> Res
 
     // --- blocked_by array of objects ---
     let blocked_by: Vec<Value> = issue.blocked_by.iter().map(blocker_to_value).collect();
-    globals.insert(
-        KString::from_static("blocked_by"),
-        Value::Array(blocked_by),
-    );
+    globals.insert(KString::from_static("blocked_by"), Value::Array(blocked_by));
 
     // --- datetime fields ---
-    let created_at = issue
-        .created_at
-        .as_ref()
-        .map(|dt| dt.to_rfc3339());
+    let created_at = issue.created_at.as_ref().map(|dt| dt.to_rfc3339());
     globals.insert(
         KString::from_static("created_at"),
         opt_str_value(created_at.as_deref()),
     );
 
-    let updated_at = issue
-        .updated_at
-        .as_ref()
-        .map(|dt| dt.to_rfc3339());
+    let updated_at = issue.updated_at.as_ref().map(|dt| dt.to_rfc3339());
     globals.insert(
         KString::from_static("updated_at"),
         opt_str_value(updated_at.as_deref()),
@@ -250,7 +230,7 @@ mod tests {
     #[test]
     fn test_priority_none_is_nil() {
         let issue = base_issue(); // priority is None
-        // Nil renders as empty string in Liquid
+                                  // Nil renders as empty string in Liquid
         let out = render_prompt("p:{{ priority }}", &issue, None).unwrap();
         assert_eq!(out, "p:");
     }
@@ -304,8 +284,7 @@ mod tests {
     #[test]
     fn test_labels_empty() {
         let issue = base_issue();
-        let out = render_prompt("{% for l in labels %}{{l}},{% endfor %}", &issue, None)
-            .unwrap();
+        let out = render_prompt("{% for l in labels %}{{l}},{% endfor %}", &issue, None).unwrap();
         assert_eq!(out, "");
     }
 
@@ -315,9 +294,12 @@ mod tests {
             labels: vec!["bug".to_string(), "p1".to_string(), "backend".to_string()],
             ..base_issue()
         };
-        let out =
-            render_prompt("{% for l in labels %}{{ l }}{% unless forloop.last %},{% endunless %}{% endfor %}", &issue, None)
-                .unwrap();
+        let out = render_prompt(
+            "{% for l in labels %}{{ l }}{% unless forloop.last %},{% endunless %}{% endfor %}",
+            &issue,
+            None,
+        )
+        .unwrap();
         assert_eq!(out, "bug,p1,backend");
     }
 
@@ -326,9 +308,12 @@ mod tests {
     #[test]
     fn test_blocked_by_empty() {
         let issue = base_issue();
-        let out =
-            render_prompt("{% for b in blocked_by %}{{ b.identifier }}{% endfor %}", &issue, None)
-                .unwrap();
+        let out = render_prompt(
+            "{% for b in blocked_by %}{{ b.identifier }}{% endfor %}",
+            &issue,
+            None,
+        )
+        .unwrap();
         assert_eq!(out, "");
     }
 

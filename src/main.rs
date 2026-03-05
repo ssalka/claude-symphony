@@ -24,7 +24,10 @@ use crate::workflow::WorkflowLoader;
 // -------------------------------------------------------------------------- //
 
 #[derive(Parser, Debug)]
-#[command(name = "symphony", about = "Orchestrate coding agents for Linear issues")]
+#[command(
+    name = "symphony",
+    about = "Orchestrate coding agents for Linear issues"
+)]
 struct Args {
     /// Path to WORKFLOW.md file
     #[arg(default_value = "./WORKFLOW.md")]
