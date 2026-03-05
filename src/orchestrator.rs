@@ -540,11 +540,11 @@ impl Orchestrator {
                         .live_session
                         .get_or_insert_with(LiveSession::default);
                 }
-                tracing::info!(issue_id = %issue_id, message = %message, "Agent notification");
+                tracing::trace!(issue_id = %issue_id, message = %message, "Agent notification");
                 ("notification".to_string(), Some(message))
             }
             AgentEvent::AssistantText { text } => {
-                tracing::info!("[{identifier}] {text}");
+                tracing::trace!("[{identifier}] {text}");
                 ("assistant_text".to_string(), Some(text))
             }
             AgentEvent::ToolEvent {
@@ -552,7 +552,7 @@ impl Orchestrator {
                 phase,
                 summary,
             } => {
-                tracing::info!("[{identifier}] Tool {phase}: {tool_name} | {summary}");
+                tracing::trace!("[{identifier}] Tool {phase}: {tool_name} | {summary}");
                 (format!("tool_{phase}"), Some(format!("{tool_name}: {summary}")))
             }
             AgentEvent::TurnResult {
@@ -561,7 +561,7 @@ impl Orchestrator {
                 total_cost_usd,
                 ..
             } => {
-                tracing::info!(
+                tracing::trace!(
                     "[{identifier}] Turn {}: {}ms, ${:.4}",
                     if success { "completed" } else { "failed" },
                     duration_ms.unwrap_or(0),
@@ -577,7 +577,7 @@ impl Orchestrator {
             }
             AgentEvent::OtherMessage { raw } => {
                 let msg = truncate(&raw, 120);
-                tracing::info!("[{identifier}] {msg}");
+                tracing::trace!("[{identifier}] {msg}");
                 ("other".to_string(), None)
             }
         };
