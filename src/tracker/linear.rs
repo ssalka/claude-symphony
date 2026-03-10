@@ -71,6 +71,29 @@ query FetchCandidates($projectSlug: String!, $states: [String!]!, $after: String
 }
 "#;
 
+const FETCH_STATE_ID_QUERY: &str = r#"
+query FetchStateIdForIssue($issueId: String!, $stateName: String!) {
+  issue(id: $issueId) {
+    team {
+      states(filter: { name: { eq: $stateName } }) {
+        nodes {
+          id
+          name
+        }
+      }
+    }
+  }
+}
+"#;
+
+const UPDATE_ISSUE_STATE_MUTATION: &str = r#"
+mutation UpdateIssueState($issueId: String!, $stateId: String!) {
+  issueUpdate(id: $issueId, input: { stateId: $stateId }) {
+    success
+  }
+}
+"#;
+
 const FETCH_ISSUE_STATES_QUERY: &str = r#"
 query FetchIssueStates($ids: [ID!]!) {
   issues(filter: { id: { in: $ids } }, first: 250) {
@@ -132,6 +155,44 @@ struct RawRelationNode {
 #[derive(Debug, serde::Deserialize)]
 struct RawRelations {
     nodes: Vec<RawRelationNode>,
+}
+
+// ---- set_issue_state response types ----------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct WorkflowStateNode {
+    id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WorkflowStateConnection {
+    nodes: Vec<WorkflowStateNode>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TeamWithStates {
+    states: WorkflowStateConnection,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IssueWithTeam {
+    team: TeamWithStates,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FetchStateIdData {
+    issue: IssueWithTeam,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IssueUpdateResult {
+    success: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UpdateIssueStateData {
+    #[serde(rename = "issueUpdate")]
+    issue_update: IssueUpdateResult,
 }
 
 /// Full issue node as returned by the candidate/states queries.
@@ -432,6 +493,47 @@ impl LinearClient {
         Ok(nodes.into_iter().map(Self::normalize_full).collect())
     }
 
+    /// Transition `issue_id` to the workflow state named `state_name`.
+    ///
+    /// 1. Resolves the state name to an ID by querying the issue's team states.
+    /// 2. Calls `issueUpdate` with the resolved state ID.
+    pub async fn set_issue_state_impl(&self, issue_id: &str, state_name: &str) -> Result<()> {
+        // Step 1: resolve state name → state ID within the issue's team.
+        let vars = serde_json::json!({
+            "issueId": issue_id,
+            "stateName": state_name,
+        });
+        let data: FetchStateIdData = self.graphql(FETCH_STATE_ID_QUERY, vars).await?;
+        let state_id = data
+            .issue
+            .team
+            .states
+            .nodes
+            .into_iter()
+            .next()
+            .map(|n| n.id)
+            .ok_or_else(|| Error::LinearUnknownPayload {
+                description: format!(
+                    "state '{}' not found in team workflow states",
+                    state_name
+                ),
+            })?;
+
+        // Step 2: update the issue.
+        let vars = serde_json::json!({
+            "issueId": issue_id,
+            "stateId": state_id,
+        });
+        let data: UpdateIssueStateData = self.graphql(UPDATE_ISSUE_STATE_MUTATION, vars).await?;
+        if !data.issue_update.success {
+            return Err(Error::LinearUnknownPayload {
+                description: "issueUpdate returned success=false".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Fetch minimal issue views (id / identifier / state) by ID.
     pub async fn fetch_issue_states_by_ids_impl(&self, ids: &[String]) -> Result<Vec<Issue>> {
         if ids.is_empty() {
@@ -469,6 +571,14 @@ impl Tracker for LinearClient {
         ids: &'a [String],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Issue>>> + Send + 'a>> {
         Box::pin(self.fetch_issue_states_by_ids_impl(ids))
+    }
+
+    fn set_issue_state<'a>(
+        &'a self,
+        issue_id: &'a str,
+        state_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.set_issue_state_impl(issue_id, state_name))
     }
 }
 

@@ -71,6 +71,9 @@ orchestrator:
     - Done
     - Cancelled
     - Duplicate
+  # Optional: move the issue to this state after the agent completes successfully.
+  # Useful for routing completed work into a human review queue before closing.
+  # review_state: In Review
 
 # ===========================================================================
 # server: optional HTTP dashboard (also enabled via --port CLI flag)

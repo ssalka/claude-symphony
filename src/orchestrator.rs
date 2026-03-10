@@ -485,15 +485,15 @@ impl Orchestrator {
                     dispatch_id,
                     reason,
                 } => {
-                    // We need config for backoff calculation. Try to parse it;
-                    // fall back to a sensible default if parsing fails.
-                    let max_backoff = {
+                    // We need config for backoff calculation and review_state.
+                    // Fall back to sensible defaults if parsing fails.
+                    let (max_backoff, review_state) = {
                         let workflow = self.config_rx.borrow().clone();
                         ServiceConfig::from_yaml(&workflow.config)
-                            .map(|c| c.agent_max_retry_backoff_ms)
-                            .unwrap_or(300_000)
+                            .map(|c| (c.agent_max_retry_backoff_ms, c.review_state))
+                            .unwrap_or((300_000, None))
                     };
-                    self.handle_worker_exit(&issue_id, dispatch_id, reason, max_backoff)
+                    self.handle_worker_exit(&issue_id, dispatch_id, reason, max_backoff, review_state)
                         .await;
                 }
             }
@@ -612,6 +612,7 @@ impl Orchestrator {
         dispatch_id: u64,
         reason: WorkerExitReason,
         max_backoff_ms: u64,
+        review_state: Option<String>,
     ) {
         let (attempt, identifier, elapsed_secs) = {
             let mut state = self.state.lock().await;
@@ -654,6 +655,38 @@ impl Orchestrator {
 
         match reason {
             WorkerExitReason::Normal => {
+                if let Some(ref state_name) = review_state {
+                    tracing::info!(
+                        issue_id = %issue_id,
+                        identifier = %identifier,
+                        state = %state_name,
+                        "Worker completed; transitioning issue to review state"
+                    );
+                    match self.tracker.set_issue_state(issue_id, state_name).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                issue_id = %issue_id,
+                                identifier = %identifier,
+                                state = %state_name,
+                                "Issue transitioned to review state"
+                            );
+                            let mut state = self.state.lock().await;
+                            state.completed.insert(issue_id.to_string());
+                            state.claimed.remove(issue_id);
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                issue_id = %issue_id,
+                                identifier = %identifier,
+                                state = %state_name,
+                                error = %e,
+                                "Failed to transition issue to review state; falling back to normal retry"
+                            );
+                        }
+                    }
+                }
+
                 tracing::info!(
                     issue_id = %issue_id,
                     "Worker exited normally; scheduling continuation retry"
@@ -848,6 +881,7 @@ mod tests {
             terminal_states: vec!["done".to_string(), "cancelled".to_string()],
             active_states_original: vec!["In Progress".to_string(), "Todo".to_string()],
             terminal_states_original: vec!["Done".to_string(), "Cancelled".to_string()],
+            review_state: None,
             server_enabled: false,
             server_port: 8080,
         }
@@ -1022,6 +1056,16 @@ mod tests {
                 Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
             > {
                 Box::pin(async { Ok(vec![]) })
+            }
+
+            fn set_issue_state<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
             }
         }
 

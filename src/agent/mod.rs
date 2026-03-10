@@ -181,6 +181,7 @@ mod tests {
             terminal_states: vec![],
             active_states_original: vec![],
             terminal_states_original: vec![],
+            review_state: None,
             server_enabled: false,
             server_port: 8080,
         })

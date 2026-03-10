@@ -37,4 +37,11 @@ pub trait Tracker: Send + Sync {
         &'a self,
         ids: &'a [String],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Issue>>> + Send + 'a>>;
+
+    /// Transition `issue_id` to the workflow state named `state_name`.
+    fn set_issue_state<'a>(
+        &'a self,
+        issue_id: &'a str,
+        state_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 }
