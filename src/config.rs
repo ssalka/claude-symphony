@@ -38,6 +38,9 @@ pub struct ServiceConfig {
     pub terminal_states: Vec<String>,
     pub active_states_original: Vec<String>,
     pub terminal_states_original: Vec<String>,
+    /// If set, the agent will move the issue to this state once it has claimed the issue
+    /// (if the issue wasn't already in that state).
+    pub started_state: Option<String>,
     /// If set, the agent will move the issue to this state after completing successfully.
     pub review_state: Option<String>,
     // server
@@ -234,6 +237,7 @@ impl ServiceConfig {
             .map(parse_state_list_preserve_case)
             .unwrap_or_default();
 
+        let started_state = opt_str(orchestrator, "started_state").map(str::to_string);
         let review_state = opt_str(orchestrator, "review_state").map(str::to_string);
 
         // ---- server ---------------------------------------------------------
@@ -274,6 +278,7 @@ impl ServiceConfig {
             terminal_states,
             active_states_original,
             terminal_states_original,
+            started_state,
             review_state,
             server_enabled,
             server_port,

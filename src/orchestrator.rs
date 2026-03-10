@@ -442,6 +442,37 @@ impl Orchestrator {
             "Dispatching worker"
         );
 
+        // Transition to started_state if configured and the issue isn't already in that state.
+        if let Some(ref started_state) = config.started_state {
+            if issue.state.to_lowercase() != started_state.to_lowercase() {
+                tracing::info!(
+                    issue_id = %issue_id,
+                    identifier = %issue_identifier,
+                    state = %started_state,
+                    "Transitioning issue to started state"
+                );
+                match self.tracker.set_issue_state(&issue_id, started_state).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            issue_id = %issue_id,
+                            identifier = %issue_identifier,
+                            state = %started_state,
+                            "Issue transitioned to started state"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            issue_id = %issue_id,
+                            identifier = %issue_identifier,
+                            state = %started_state,
+                            error = %e,
+                            "Failed to transition issue to started state; continuing dispatch"
+                        );
+                    }
+                }
+            }
+        }
+
         // Spawn worker task.
         let runner = AgentRunner {
             config: Arc::new(config.clone()),
@@ -887,6 +918,7 @@ mod tests {
             terminal_states: vec!["done".to_string(), "cancelled".to_string()],
             active_states_original: vec!["In Progress".to_string(), "Todo".to_string()],
             terminal_states_original: vec!["Done".to_string(), "Cancelled".to_string()],
+            started_state: None,
             review_state: None,
             server_enabled: false,
             server_port: 8080,
@@ -1419,6 +1451,195 @@ mod tests {
         assert!(
             !state.retry_attempts.contains_key("issue-abc"),
             "no retry should be scheduled when review state succeeds"
+        );
+    }
+
+    // ---------------------------------------------------------------------- //
+    // started_state — set_issue_state called on dispatch when state differs
+    // ---------------------------------------------------------------------- //
+
+    #[tokio::test]
+    async fn started_state_calls_set_issue_state_on_dispatch() {
+        use std::sync::Mutex as StdMutex;
+
+        struct SpyTracker {
+            calls: Arc<StdMutex<Vec<(String, String)>>>,
+        }
+
+        impl crate::tracker::Tracker for SpyTracker {
+            fn fetch_candidate_issues<'a>(
+                &'a self,
+                _: &'a [String],
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn fetch_issues_by_states<'a>(
+                &'a self,
+                _: &'a [String],
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn fetch_issue_states_by_ids<'a>(
+                &'a self,
+                _: &'a [String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn set_issue_state<'a>(
+                &'a self,
+                issue_id: &'a str,
+                state_name: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                let calls = Arc::clone(&self.calls);
+                let issue_id = issue_id.to_string();
+                let state_name = state_name.to_string();
+                Box::pin(async move {
+                    calls.lock().unwrap().push((issue_id, state_name));
+                    Ok(())
+                })
+            }
+        }
+
+        let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
+        let tracker = Arc::new(SpyTracker {
+            calls: Arc::clone(&spy_calls),
+        });
+
+        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
+            config: serde_yaml::Value::Null,
+            prompt_template: String::new(),
+        }));
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
+        std::mem::forget(config_tx);
+
+        let mut orch = Orchestrator::new(
+            WorkflowDefinition {
+                config: serde_yaml::Value::Null,
+                prompt_template: String::new(),
+            },
+            config_rx,
+            tracker,
+            refresh_rx,
+        );
+
+        let mut config = make_config();
+        config.started_state = Some("In Progress".to_string());
+
+        // Issue is in "Todo" — different from started_state, so a transition is expected.
+        let issue = make_issue("issue-xyz", "ENG-99", "Todo");
+
+        orch.dispatch(issue, &config).await;
+
+        // set_issue_state must have been called once with the right arguments.
+        let calls = spy_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one set_issue_state call");
+        assert_eq!(calls[0].0, "issue-xyz");
+        assert_eq!(calls[0].1, "In Progress");
+    }
+
+    #[tokio::test]
+    async fn started_state_skipped_when_issue_already_in_that_state() {
+        use std::sync::Mutex as StdMutex;
+
+        struct SpyTracker {
+            calls: Arc<StdMutex<Vec<(String, String)>>>,
+        }
+
+        impl crate::tracker::Tracker for SpyTracker {
+            fn fetch_candidate_issues<'a>(
+                &'a self,
+                _: &'a [String],
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn fetch_issues_by_states<'a>(
+                &'a self,
+                _: &'a [String],
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn fetch_issue_states_by_ids<'a>(
+                &'a self,
+                _: &'a [String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn set_issue_state<'a>(
+                &'a self,
+                issue_id: &'a str,
+                state_name: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                let calls = Arc::clone(&self.calls);
+                let issue_id = issue_id.to_string();
+                let state_name = state_name.to_string();
+                Box::pin(async move {
+                    calls.lock().unwrap().push((issue_id, state_name));
+                    Ok(())
+                })
+            }
+        }
+
+        let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
+        let tracker = Arc::new(SpyTracker {
+            calls: Arc::clone(&spy_calls),
+        });
+
+        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
+            config: serde_yaml::Value::Null,
+            prompt_template: String::new(),
+        }));
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
+        std::mem::forget(config_tx);
+
+        let mut orch = Orchestrator::new(
+            WorkflowDefinition {
+                config: serde_yaml::Value::Null,
+                prompt_template: String::new(),
+            },
+            config_rx,
+            tracker,
+            refresh_rx,
+        );
+
+        let mut config = make_config();
+        config.started_state = Some("In Progress".to_string());
+
+        // Issue is already in "In Progress" — no transition should happen.
+        let issue = make_issue("issue-xyz", "ENG-99", "In Progress");
+
+        orch.dispatch(issue, &config).await;
+
+        let calls = spy_calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            0,
+            "set_issue_state should not be called when issue is already in started_state"
         );
     }
 }
