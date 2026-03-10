@@ -513,10 +513,7 @@ impl LinearClient {
             .next()
             .map(|n| n.id)
             .ok_or_else(|| Error::LinearUnknownPayload {
-                description: format!(
-                    "state '{}' not found in team workflow states",
-                    state_name
-                ),
+                description: format!("state '{}' not found in team workflow states", state_name),
             })?;
 
         // Step 2: update the issue.

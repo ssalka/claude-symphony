@@ -493,8 +493,14 @@ impl Orchestrator {
                             .map(|c| (c.agent_max_retry_backoff_ms, c.review_state))
                             .unwrap_or((300_000, None))
                     };
-                    self.handle_worker_exit(&issue_id, dispatch_id, reason, max_backoff, review_state)
-                        .await;
+                    self.handle_worker_exit(
+                        &issue_id,
+                        dispatch_id,
+                        reason,
+                        max_backoff,
+                        review_state,
+                    )
+                    .await;
                 }
             }
         }
@@ -1283,5 +1289,136 @@ mod tests {
         }];
 
         assert!(orch.is_eligible(&issue, &config).await);
+    }
+
+    // ---------------------------------------------------------------------- //
+    // review_state — set_issue_state called on normal worker exit
+    // ---------------------------------------------------------------------- //
+
+    #[tokio::test]
+    async fn review_state_calls_set_issue_state_on_normal_exit() {
+        use std::sync::Mutex as StdMutex;
+
+        // A tracker that records every set_issue_state call.
+        struct SpyTracker {
+            calls: Arc<StdMutex<Vec<(String, String)>>>,
+        }
+
+        impl crate::tracker::Tracker for SpyTracker {
+            fn fetch_candidate_issues<'a>(
+                &'a self,
+                _: &'a [String],
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn fetch_issues_by_states<'a>(
+                &'a self,
+                _: &'a [String],
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn fetch_issue_states_by_ids<'a>(
+                &'a self,
+                _: &'a [String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn set_issue_state<'a>(
+                &'a self,
+                issue_id: &'a str,
+                state_name: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                let calls = Arc::clone(&self.calls);
+                let issue_id = issue_id.to_string();
+                let state_name = state_name.to_string();
+                Box::pin(async move {
+                    calls.lock().unwrap().push((issue_id, state_name));
+                    Ok(())
+                })
+            }
+        }
+
+        let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
+        let tracker = Arc::new(SpyTracker {
+            calls: Arc::clone(&spy_calls),
+        });
+
+        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
+            config: serde_yaml::Value::Null,
+            prompt_template: String::new(),
+        }));
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
+        std::mem::forget(config_tx);
+
+        let mut orch = Orchestrator::new(
+            WorkflowDefinition {
+                config: serde_yaml::Value::Null,
+                prompt_template: String::new(),
+            },
+            config_rx,
+            tracker,
+            refresh_rx,
+        );
+
+        // Seed a running entry so handle_worker_exit finds it.
+        {
+            let mut state = orch.state.lock().await;
+            state.running.insert(
+                "issue-abc".to_string(),
+                RunningEntry {
+                    issue: make_issue("issue-abc", "ENG-42", "In Progress"),
+                    attempt: 1,
+                    dispatch_id: 7,
+                    live_session: None,
+                    started_at: std::time::Instant::now(),
+                    cancel_token: CancellationToken::new(),
+                },
+            );
+            state.claimed.insert("issue-abc".to_string());
+        }
+
+        orch.handle_worker_exit(
+            "issue-abc",
+            7,
+            WorkerExitReason::Normal,
+            300_000,
+            Some("In Review".to_string()),
+        )
+        .await;
+
+        // set_issue_state should have been called once with the right arguments.
+        let calls = spy_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one set_issue_state call");
+        assert_eq!(calls[0].0, "issue-abc");
+        assert_eq!(calls[0].1, "In Review");
+        drop(calls);
+
+        // Issue should be marked completed, not retried.
+        let state = orch.state.lock().await;
+        assert!(
+            state.completed.contains("issue-abc"),
+            "issue should be marked completed after review state transition"
+        );
+        assert!(
+            !state.claimed.contains("issue-abc"),
+            "issue should be removed from claimed"
+        );
+        assert!(
+            !state.retry_attempts.contains_key("issue-abc"),
+            "no retry should be scheduled when review state succeeds"
+        );
     }
 }
