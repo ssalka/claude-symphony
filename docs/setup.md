@@ -64,7 +64,8 @@ Open `WORKFLOW.md` in your project and set:
 ```yaml
 tracker:
   # e.g. linear.app/org/project/myproject-56c29d052a37/overview → "myproject-56c29d052a37"
-  project_slug: YOUR_TEAM_SLUG
+  project_slugs:
+    - myproject-56c29d052a37
 ```
 
 Update the `workspace` section to match your project:

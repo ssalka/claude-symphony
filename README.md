@@ -71,7 +71,8 @@ At minimum, set your Linear team slug and the `after_create` hook that seeds eac
 ```yaml
 tracker:
   api_key: $LINEAR_API_KEY
-  project_slug: YOUR_TEAM_SLUG   # e.g. "eng" from linear.app/org/eng/...
+  project_slugs:
+    - your-project-239b7e6def9a   # from the project url in Linear
 
 workspace:
   root: ~/workspaces
@@ -108,7 +109,8 @@ The workflow file is a single Markdown file with a YAML front-matter block follo
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY          # env var reference — never commit the raw key
-  project_slug: YOUR_TEAM_SLUG
+  project_slugs:
+    - your-project-239b7e6def9a     # from the project url in Linear
 
 workspace:
   root: ~/workspaces

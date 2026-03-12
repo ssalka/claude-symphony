@@ -13,7 +13,9 @@ tracker:
   api_key: $LINEAR_API_KEY
   # The slug of your Linear team (visible in the URL: linear.app/<slug>/...)
   # Replace this with your actual team slug before running.
-  project_slug: YOUR_TEAM_SLUG
+  # e.g. linear.app/org/project/myproject-56c29d052a37/overview → "myproject-56c29d052a37"
+  project_slugs:
+    - myproject-56c29d052a37
 
 # ===========================================================================
 # workspace: one isolated directory per Linear issue

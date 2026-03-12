@@ -175,7 +175,7 @@ mod tests {
 tracker:
   kind: linear
   api_key: my-key
-  project_slug: my-project
+  project_slugs: [my-project]
 workspace:
   root: /tmp
 agent:
@@ -237,7 +237,7 @@ This is the prompt for {{ issue.title }}.
         // With splitn(3, "---") on "---\ntracker:\n  kind: linear\n",
         // we get ["", "\ntracker:\n  kind: linear\n"] — only 2 segments,
         // so prompt_template will be empty.
-        let content = "---\ntracker:\n  kind: linear\n  api_key: k\n  project_slug: p\nworkspace:\n  root: /tmp\nagent:\n  command: claude\n";
+        let content = "---\ntracker:\n  kind: linear\n  api_key: k\n  project_slugs: [p]\nworkspace:\n  root: /tmp\nagent:\n  command: claude\n";
         let def = parse_workflow_file(content).unwrap();
         assert_eq!(def.prompt_template, "");
     }
@@ -256,7 +256,7 @@ This is the prompt for {{ issue.title }}.
     #[test]
     fn test_multi_section_prompt_body() {
         // The prompt body itself contains `---` — should all be in prompt_template.
-        let content = "---\ntracker:\n  kind: linear\n  api_key: k\n  project_slug: p\nworkspace:\n  root: /tmp\nagent:\n  command: claude\n---\nLine one\n---\nLine two\n";
+        let content = "---\ntracker:\n  kind: linear\n  api_key: k\n  project_slugs: [p]\nworkspace:\n  root: /tmp\nagent:\n  command: claude\n---\nLine one\n---\nLine two\n";
         let def = parse_workflow_file(content).unwrap();
         // The third segment (index 2) is "Line one\n---\nLine two\n".
         assert!(def.prompt_template.contains("Line one"));

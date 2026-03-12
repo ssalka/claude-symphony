@@ -159,7 +159,7 @@ impl ServiceConfig {
         };
 
         let tracker_project_slugs = tracker
-            .get("project_slug")
+            .get("project_slugs")
             .map(parse_slug_list)
             .unwrap_or_default();
         let tracker_endpoint = opt_str(tracker, "endpoint").map(str::to_string);
@@ -355,7 +355,7 @@ mod tests {
 tracker:
   kind: linear
   api_key: "{api_key}"
-  project_slug: my-project
+  project_slugs: [my-project]
 
 workspace:
   root: /tmp/workspaces
@@ -393,7 +393,7 @@ orchestrator:
 tracker:
   kind: linear
   api_key: k
-  project_slug:
+  project_slugs:
     - project-a
     - project-b
 workspace:
@@ -438,7 +438,7 @@ orchestrator:
 tracker:
   kind: linear
   api_key: "k"
-  project_slug: proj
+  project_slugs: [proj]
 
 workspace:
   root: /tmp
@@ -488,7 +488,7 @@ server:
 tracker:
   kind: linear
   api_key: k
-  project_slug: p
+  project_slugs: [p]
 workspace:
   root: /tmp
 agent:
@@ -517,7 +517,7 @@ orchestrator:
 tracker:
   kind: linear
   api_key: k
-  project_slug: p
+  project_slugs: [p]
 workspace:
   root: /tmp
 agent:
@@ -548,7 +548,7 @@ orchestrator:
 tracker:
   kind: linear
   api_key: $SYMPHONY_TEST_API_KEY
-  project_slug: proj
+  project_slugs: [proj]
 workspace:
   root: /tmp
 agent:
@@ -570,7 +570,7 @@ agent:
 tracker:
   kind: linear
   api_key: $SYMPHONY_TEST_MISSING_VAR_XYZ
-  project_slug: proj
+  project_slugs: [proj]
 workspace:
   root: /tmp
 agent:
@@ -591,7 +591,7 @@ agent:
 tracker:
   kind: linear
   api_key: k
-  project_slug: p
+  project_slugs: [p]
 workspace:
   root: ~/code/workspaces
 agent:
@@ -621,7 +621,7 @@ agent:
 tracker:
   kind: linear
   api_key: k
-  project_slug: p
+  project_slugs: [p]
 workspace:
   root: /tmp
 agent:
@@ -657,7 +657,7 @@ orchestrator:
 tracker:
   kind: jira
   api_key: k
-  project_slug: p
+  project_slugs: [p]
 workspace:
   root: /tmp
 agent:
@@ -680,7 +680,7 @@ agent:
 tracker:
   kind: linear
   api_key: ""
-  project_slug: p
+  project_slugs: [p]
 workspace:
   root: /tmp
 agent:
@@ -700,7 +700,7 @@ agent:
 tracker:
   kind: linear
   api_key: k
-  project_slug: ""
+  project_slugs: [""]
 workspace:
   root: /tmp
 agent:
@@ -723,7 +723,7 @@ agent:
 tracker:
   kind: linear
   api_key: k
-  project_slug: p
+  project_slugs: [p]
 workspace:
   root: /tmp
 agent:
@@ -743,7 +743,7 @@ agent:
 tracker:
   kind: linear
   api_key: k
-  project_slug: p
+  project_slugs: [p]
 workspace:
   root: /tmp
 agent:
@@ -773,7 +773,7 @@ agent:
 tracker:
   kind: linear
   api_key: k
-  project_slug: p
+  project_slugs: [p]
 workspace:
   root: /tmp
   after_create: "git clone ..."
@@ -802,7 +802,7 @@ agent:
 tracker:
   kind: linear
   api_key: k
-  project_slug: p
+  project_slugs: [p]
   endpoint: https://api.example.com/graphql
 workspace:
   root: /tmp
