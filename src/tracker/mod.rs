@@ -15,12 +15,12 @@ use crate::error::Result;
 /// All methods are async and return heap-allocated futures so that the trait
 /// can be used as `dyn Tracker` without needing `async_trait`.
 pub trait Tracker: Send + Sync {
-    /// Fetch all open issues in `project_slug` whose state is in
+    /// Fetch all open issues in `project_slugs` whose state is in
     /// `active_states`. Blocker information is included.
     fn fetch_candidate_issues<'a>(
         &'a self,
         active_states: &'a [String],
-        project_slug: &'a str,
+        project_slugs: &'a [String],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Issue>>> + Send + 'a>>;
 
     /// Fetch issues filtered by arbitrary state names. Returns an empty vec
@@ -28,7 +28,7 @@ pub trait Tracker: Send + Sync {
     fn fetch_issues_by_states<'a>(
         &'a self,
         states: &'a [String],
-        project_slug: &'a str,
+        project_slugs: &'a [String],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Issue>>> + Send + 'a>>;
 
     /// Fetch a minimal view (id / identifier / state) for the given issue IDs.

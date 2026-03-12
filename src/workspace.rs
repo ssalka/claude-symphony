@@ -220,7 +220,7 @@ mod tests {
         ServiceConfig {
             tracker_kind: "linear".into(),
             tracker_api_key: "key".into(),
-            tracker_project_slug: "proj".into(),
+            tracker_project_slugs: vec!["proj".into()],
             tracker_endpoint: None,
             workspace_root,
             workspace_after_create: None,

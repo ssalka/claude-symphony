@@ -31,10 +31,10 @@ const STATES_PAGE_SIZE: u32 = 250;
 // -------------------------------------------------------------------------- //
 
 const FETCH_CANDIDATES_QUERY: &str = r#"
-query FetchCandidates($projectSlug: String!, $states: [String!]!, $after: String) {
+query FetchCandidates($projectSlugs: [String!]!, $states: [String!]!, $after: String) {
   issues(
     filter: {
-      project: { slugId: { eq: $projectSlug } }
+      project: { slugId: { in: $projectSlugs } }
       state: { name: { in: $states } }
     }
     first: 50
@@ -452,19 +452,19 @@ impl LinearClient {
     // Public fetch methods (concrete implementations)
     // ---------------------------------------------------------------------- //
 
-    /// Fetch all candidate issues in `project_slug` with states in
+    /// Fetch all candidate issues in `project_slugs` with states in
     /// `active_states`.
     pub async fn fetch_candidate_issues_impl(
         &self,
         active_states: &[String],
-        project_slug: &str,
+        project_slugs: &[String],
     ) -> Result<Vec<Issue>> {
         if active_states.is_empty() {
             return Ok(vec![]);
         }
 
         let vars = serde_json::json!({
-            "projectSlug": project_slug,
+            "projectSlugs": project_slugs,
             "states": active_states,
         });
 
@@ -473,18 +473,18 @@ impl LinearClient {
         Ok(nodes.into_iter().map(Self::normalize_full).collect())
     }
 
-    /// Fetch issues filtered by `states` in `project_slug`.
+    /// Fetch issues filtered by `states` in `project_slugs`.
     pub async fn fetch_issues_by_states_impl(
         &self,
         states: &[String],
-        project_slug: &str,
+        project_slugs: &[String],
     ) -> Result<Vec<Issue>> {
         if states.is_empty() {
             return Ok(vec![]);
         }
 
         let vars = serde_json::json!({
-            "projectSlug": project_slug,
+            "projectSlugs": project_slugs,
             "states": states,
         });
 
@@ -550,17 +550,17 @@ impl Tracker for LinearClient {
     fn fetch_candidate_issues<'a>(
         &'a self,
         active_states: &'a [String],
-        project_slug: &'a str,
+        project_slugs: &'a [String],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Issue>>> + Send + 'a>> {
-        Box::pin(self.fetch_candidate_issues_impl(active_states, project_slug))
+        Box::pin(self.fetch_candidate_issues_impl(active_states, project_slugs))
     }
 
     fn fetch_issues_by_states<'a>(
         &'a self,
         states: &'a [String],
-        project_slug: &'a str,
+        project_slugs: &'a [String],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Issue>>> + Send + 'a>> {
-        Box::pin(self.fetch_issues_by_states_impl(states, project_slug))
+        Box::pin(self.fetch_issues_by_states_impl(states, project_slugs))
     }
 
     fn fetch_issue_states_by_ids<'a>(
@@ -784,10 +784,7 @@ mod tests {
             "fake-key".to_string(),
             Some("http://127.0.0.1:19999/no-server".to_string()),
         );
-        let result = client
-            .fetch_issues_by_states_impl(&[], "my-project")
-            .await
-            .unwrap();
+        let result = client.fetch_issues_by_states_impl(&[], &[]).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -807,10 +804,7 @@ mod tests {
             "fake-key".to_string(),
             Some("http://127.0.0.1:19999/no-server".to_string()),
         );
-        let result = client
-            .fetch_candidate_issues_impl(&[], "my-project")
-            .await
-            .unwrap();
+        let result = client.fetch_candidate_issues_impl(&[], &[]).await.unwrap();
         assert!(result.is_empty());
     }
 

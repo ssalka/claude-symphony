@@ -14,7 +14,7 @@ pub struct ServiceConfig {
     // tracker
     pub tracker_kind: String,
     pub tracker_api_key: String,
-    pub tracker_project_slug: String,
+    pub tracker_project_slugs: Vec<String>,
     pub tracker_endpoint: Option<String>,
     // workspace
     pub workspace_root: PathBuf,
@@ -82,6 +82,25 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 /// Parse a YAML value that is either a sequence of strings or a single
+/// (possibly comma-separated) string into a `Vec<String>`.
+fn parse_slug_list(val: &serde_yaml::Value) -> Vec<String> {
+    match val {
+        serde_yaml::Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        serde_yaml::Value::String(s) => s
+            .split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Parse a YAML value that is either a sequence of strings or a single
 /// comma-separated string. Returns `(lowercased, original_case)` pairs.
 fn parse_state_list_preserve_case(val: &serde_yaml::Value) -> (Vec<String>, Vec<String>) {
     let original: Vec<String> = match val {
@@ -139,7 +158,10 @@ impl ServiceConfig {
             resolve_env(raw_api_key)?
         };
 
-        let tracker_project_slug = req_str(tracker, "project_slug").to_string();
+        let tracker_project_slugs = tracker
+            .get("project_slug")
+            .map(parse_slug_list)
+            .unwrap_or_default();
         let tracker_endpoint = opt_str(tracker, "endpoint").map(str::to_string);
 
         // ---- workspace ------------------------------------------------------
@@ -257,7 +279,7 @@ impl ServiceConfig {
         Ok(ServiceConfig {
             tracker_kind,
             tracker_api_key,
-            tracker_project_slug,
+            tracker_project_slugs,
             tracker_endpoint,
             workspace_root,
             workspace_after_create,
@@ -301,7 +323,7 @@ impl ServiceConfig {
         if self.tracker_api_key.is_empty() {
             return Err(Error::MissingTrackerApiKey);
         }
-        if self.tracker_project_slug.is_empty() {
+        if self.tracker_project_slugs.is_empty() {
             return Err(Error::MissingTrackerProjectSlug);
         }
         if self.agent_command.is_empty() {
@@ -359,9 +381,33 @@ orchestrator:
 
         assert_eq!(cfg.tracker_kind, "linear");
         assert_eq!(cfg.tracker_api_key, "my-api-key");
-        assert_eq!(cfg.tracker_project_slug, "my-project");
+        assert_eq!(cfg.tracker_project_slugs, vec!["my-project"]);
         assert_eq!(cfg.workspace_root, PathBuf::from("/tmp/workspaces"));
         assert_eq!(cfg.agent_command, "claude");
+    }
+
+    #[test]
+    fn test_project_slug_as_list() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+tracker:
+  kind: linear
+  api_key: k
+  project_slug:
+    - project-a
+    - project-b
+workspace:
+  root: /tmp
+agent:
+  command: claude
+orchestrator:
+  active_states:
+    - in progress
+"#,
+        )
+        .unwrap();
+        let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
+        assert_eq!(cfg.tracker_project_slugs, vec!["project-a", "project-b"]);
     }
 
     #[test]

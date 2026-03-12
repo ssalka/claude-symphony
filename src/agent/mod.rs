@@ -160,7 +160,7 @@ mod tests {
         Arc::new(ServiceConfig {
             tracker_kind: "linear".to_string(),
             tracker_api_key: "test-key".to_string(),
-            tracker_project_slug: "test-project".to_string(),
+            tracker_project_slugs: vec!["test-project".to_string()],
             tracker_endpoint: None,
             workspace_root: PathBuf::from("/tmp/symphony-test-workspaces"),
             workspace_after_create: None,

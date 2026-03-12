@@ -87,7 +87,7 @@ impl Orchestrator {
     pub async fn startup_cleanup(&self, config: &ServiceConfig) {
         match self
             .tracker
-            .fetch_issues_by_states(&config.terminal_states, &config.tracker_project_slug)
+            .fetch_issues_by_states(&config.terminal_states, &config.tracker_project_slugs)
             .await
         {
             Ok(issues) => {
@@ -153,7 +153,7 @@ impl Orchestrator {
                     .tracker
                     .fetch_candidate_issues(
                         &config.active_states_original,
-                        &config.tracker_project_slug,
+                        &config.tracker_project_slugs,
                     )
                     .await
                 {
@@ -897,7 +897,7 @@ mod tests {
         ServiceConfig {
             tracker_kind: "linear".to_string(),
             tracker_api_key: "test-key".to_string(),
-            tracker_project_slug: "test-project".to_string(),
+            tracker_project_slugs: vec!["test-project".to_string()],
             tracker_endpoint: None,
             workspace_root: std::path::PathBuf::from("/tmp"),
             workspace_after_create: None,
@@ -1070,7 +1070,7 @@ mod tests {
             fn fetch_candidate_issues<'a>(
                 &'a self,
                 _: &'a [String],
-                _: &'a str,
+                _: &'a [String],
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
             > {
@@ -1080,7 +1080,7 @@ mod tests {
             fn fetch_issues_by_states<'a>(
                 &'a self,
                 _: &'a [String],
-                _: &'a str,
+                _: &'a [String],
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
             > {
@@ -1340,7 +1340,7 @@ mod tests {
             fn fetch_candidate_issues<'a>(
                 &'a self,
                 _: &'a [String],
-                _: &'a str,
+                _: &'a [String],
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
             > {
@@ -1350,7 +1350,7 @@ mod tests {
             fn fetch_issues_by_states<'a>(
                 &'a self,
                 _: &'a [String],
-                _: &'a str,
+                _: &'a [String],
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
             > {
@@ -1470,7 +1470,7 @@ mod tests {
             fn fetch_candidate_issues<'a>(
                 &'a self,
                 _: &'a [String],
-                _: &'a str,
+                _: &'a [String],
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
             > {
@@ -1480,7 +1480,7 @@ mod tests {
             fn fetch_issues_by_states<'a>(
                 &'a self,
                 _: &'a [String],
-                _: &'a str,
+                _: &'a [String],
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
             > {
@@ -1562,7 +1562,7 @@ mod tests {
             fn fetch_candidate_issues<'a>(
                 &'a self,
                 _: &'a [String],
-                _: &'a str,
+                _: &'a [String],
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
             > {
@@ -1572,7 +1572,7 @@ mod tests {
             fn fetch_issues_by_states<'a>(
                 &'a self,
                 _: &'a [String],
-                _: &'a str,
+                _: &'a [String],
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
             > {

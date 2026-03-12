@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     let config = ServiceConfig::from_yaml(&initial_workflow.config)?;
 
     tracing::info!(
-        project_slug = %config.tracker_project_slug,
+        project_slugs = ?config.tracker_project_slugs,
         active_states = ?config.active_states,
         poll_interval_ms = config.poll_interval_ms,
         max_concurrent = config.max_concurrent_agents,
