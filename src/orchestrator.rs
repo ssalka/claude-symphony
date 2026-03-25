@@ -174,8 +174,10 @@ impl Orchestrator {
                     }
                 };
 
-                // 6. Sort candidates.
-                sort_candidates(&mut candidates);
+                // 6. Compute transitive block counts and sort candidates.
+                let block_counts =
+                    compute_transitive_block_counts(&candidates, &config.terminal_states);
+                sort_candidates(&mut candidates, &block_counts);
 
                 // 7. Dispatch eligible issues.
                 for issue in candidates {
@@ -813,12 +815,99 @@ impl Orchestrator {
 // Helper functions
 // -------------------------------------------------------------------------- //
 
+/// Build a dependency graph from candidate issues and compute transitive block
+/// counts via BFS, mirroring Venator's `computeTopBlockers` algorithm.
+///
+/// Returns a map of `identifier → count` where count is the number of active
+/// issues transitively blocked by the given issue. Only entries with count > 0
+/// are included.
+pub fn compute_transitive_block_counts(
+    issues: &[Issue],
+    terminal_states: &[String],
+) -> std::collections::HashMap<String, usize> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // Known universe of identifiers.
+    let universe: HashSet<&str> = issues.iter().map(|i| i.identifier.as_str()).collect();
+
+    // Build forward adjacency (blocker → set of issues it blocks) by inverting
+    // each issue's `blocked_by` field. Track which issues have an active blocker.
+    let mut forward: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut has_active_blocker: HashSet<&str> = HashSet::new();
+
+    for issue in issues {
+        for bref in &issue.blocked_by {
+            let blocker_id = match bref.identifier.as_deref() {
+                Some(id) => id,
+                None => continue,
+            };
+            if !universe.contains(blocker_id) {
+                continue;
+            }
+            // Skip terminal blockers — they're done.
+            if let Some(ref st) = bref.state {
+                if terminal_states.contains(&st.to_lowercase()) {
+                    continue;
+                }
+            }
+            forward
+                .entry(blocker_id)
+                .or_default()
+                .insert(issue.identifier.as_str());
+            has_active_blocker.insert(issue.identifier.as_str());
+        }
+    }
+
+    // Unblocked roots: issues with no active blocker.
+    let roots: Vec<&str> = universe
+        .iter()
+        .copied()
+        .filter(|id| !has_active_blocker.contains(id))
+        .collect();
+
+    // BFS from each root to count transitively reachable issues.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for root in roots {
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(root);
+        queue.push_back(root);
+        while let Some(node) = queue.pop_front() {
+            if let Some(neighbors) = forward.get(node) {
+                for &nb in neighbors {
+                    if visited.insert(nb) {
+                        queue.push_back(nb);
+                    }
+                }
+            }
+        }
+        let count = visited.len() - 1; // exclude self
+        if count > 0 {
+            counts.insert(root.to_string(), count);
+        }
+    }
+
+    counts
+}
+
 /// Sort `issues` in-place by dispatch priority:
-/// 1. Priority ascending (None last).
-/// 2. `created_at` oldest first (None last).
-/// 3. `identifier` lexicographic ascending.
-pub fn sort_candidates(issues: &mut [Issue]) {
+/// 1. Transitive block count descending (most-blocking first).
+/// 2. Priority ascending (None last).
+/// 3. `created_at` oldest first (None last).
+/// 4. `identifier` lexicographic ascending.
+pub fn sort_candidates(
+    issues: &mut [Issue],
+    block_counts: &std::collections::HashMap<String, usize>,
+) {
     issues.sort_by(|a, b| {
+        // Transitive block count: higher first (descending).
+        let ba = block_counts.get(&a.identifier).copied().unwrap_or(0);
+        let bb = block_counts.get(&b.identifier).copied().unwrap_or(0);
+        let block_cmp = bb.cmp(&ba);
+        if block_cmp != std::cmp::Ordering::Equal {
+            return block_cmp;
+        }
+
         // Priority: Some(low) < Some(high) < None.
         let pa = a.priority;
         let pb = b.priority;
@@ -869,6 +958,7 @@ mod tests {
     use super::*;
     use crate::domain::BlockerRef;
     use chrono::TimeZone;
+    use std::collections::HashMap;
     use tokio_util::sync::CancellationToken;
 
     // ---------------------------------------------------------------------- //
@@ -987,7 +1077,7 @@ mod tests {
                 i
             },
         ];
-        sort_candidates(&mut issues);
+        sort_candidates(&mut issues, &HashMap::new());
         assert_eq!(issues[0].identifier, "ENG-2"); // priority 1 first
         assert_eq!(issues[1].identifier, "ENG-1"); // priority 3 second
         assert_eq!(issues[2].identifier, "ENG-3"); // None last
@@ -1015,7 +1105,7 @@ mod tests {
                 i
             },
         ];
-        sort_candidates(&mut issues);
+        sort_candidates(&mut issues, &HashMap::new());
         assert_eq!(issues[0].identifier, "ENG-1"); // oldest
         assert_eq!(issues[1].identifier, "ENG-2");
         assert_eq!(issues[2].identifier, "ENG-3"); // None last
@@ -1038,7 +1128,7 @@ mod tests {
                 i
             },
         ];
-        sort_candidates(&mut issues);
+        sort_candidates(&mut issues, &HashMap::new());
         assert_eq!(issues[0].identifier, "ENG-A");
         assert_eq!(issues[1].identifier, "ENG-B");
     }
@@ -1046,14 +1136,14 @@ mod tests {
     #[test]
     fn sort_empty_list() {
         let mut issues: Vec<Issue> = vec![];
-        sort_candidates(&mut issues);
+        sort_candidates(&mut issues, &HashMap::new());
         assert!(issues.is_empty());
     }
 
     #[test]
     fn sort_single_element() {
         let mut issues = vec![make_issue("1", "ENG-1", "todo")];
-        sort_candidates(&mut issues);
+        sort_candidates(&mut issues, &HashMap::new());
         assert_eq!(issues.len(), 1);
     }
 
@@ -1641,5 +1731,177 @@ mod tests {
             0,
             "set_issue_state should not be called when issue is already in started_state"
         );
+    }
+
+    // ---------------------------------------------------------------------- //
+    // compute_transitive_block_counts
+    // ---------------------------------------------------------------------- //
+
+    fn terminal() -> Vec<String> {
+        vec!["done".to_string(), "cancelled".to_string()]
+    }
+
+    #[test]
+    fn block_counts_empty_when_no_blockers() {
+        let issues = vec![
+            make_issue("1", "ENG-1", "todo"),
+            make_issue("2", "ENG-2", "todo"),
+        ];
+        let counts = compute_transitive_block_counts(&issues, &terminal());
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn block_counts_simple_chain() {
+        // A blocks B blocks C  =>  A: 2, B: 1
+        let a = make_issue("a", "ENG-A", "todo");
+        let mut b = make_issue("b", "ENG-B", "todo");
+        b.blocked_by = vec![BlockerRef {
+            id: None,
+            identifier: Some("ENG-A".to_string()),
+            state: Some("todo".to_string()),
+        }];
+        let mut c = make_issue("c", "ENG-C", "todo");
+        c.blocked_by = vec![BlockerRef {
+            id: None,
+            identifier: Some("ENG-B".to_string()),
+            state: Some("todo".to_string()),
+        }];
+
+        let counts = compute_transitive_block_counts(&[a, b, c], &terminal());
+        assert_eq!(counts.get("ENG-A").copied().unwrap_or(0), 2);
+        // B is not a root (blocked by A), so it has no entry.
+        assert_eq!(counts.get("ENG-B").copied().unwrap_or(0), 0);
+        assert_eq!(counts.get("ENG-C").copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn block_counts_diamond() {
+        // A blocks B and C; B and C both block D  =>  A: 3, B: 1, C: 1
+        let a = make_issue("a", "ENG-A", "todo");
+        let mut b = make_issue("b", "ENG-B", "todo");
+        b.blocked_by = vec![BlockerRef {
+            id: None,
+            identifier: Some("ENG-A".to_string()),
+            state: Some("todo".to_string()),
+        }];
+        let mut c = make_issue("c", "ENG-C", "todo");
+        c.blocked_by = vec![BlockerRef {
+            id: None,
+            identifier: Some("ENG-A".to_string()),
+            state: Some("todo".to_string()),
+        }];
+        let mut d = make_issue("d", "ENG-D", "todo");
+        d.blocked_by = vec![
+            BlockerRef {
+                id: None,
+                identifier: Some("ENG-B".to_string()),
+                state: Some("todo".to_string()),
+            },
+            BlockerRef {
+                id: None,
+                identifier: Some("ENG-C".to_string()),
+                state: Some("todo".to_string()),
+            },
+        ];
+
+        let counts = compute_transitive_block_counts(&[a, b, c, d], &terminal());
+        assert_eq!(counts.get("ENG-A").copied().unwrap_or(0), 3);
+        // B and C are not roots (blocked by A), so they have no entry.
+        assert_eq!(counts.get("ENG-B").copied().unwrap_or(0), 0);
+        assert_eq!(counts.get("ENG-C").copied().unwrap_or(0), 0);
+        assert_eq!(counts.get("ENG-D").copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn block_counts_terminal_blocker_excluded() {
+        // A blocks B, but A's state is "done" (terminal) => edge excluded, both 0
+        let a = make_issue("a", "ENG-A", "todo");
+        let mut b = make_issue("b", "ENG-B", "todo");
+        b.blocked_by = vec![BlockerRef {
+            id: None,
+            identifier: Some("ENG-A".to_string()),
+            state: Some("Done".to_string()),
+        }];
+
+        let counts = compute_transitive_block_counts(&[a, b], &terminal());
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn block_counts_external_blocker_ignored() {
+        // B blocked by X (not in candidate set) => B is unblocked root, count 0
+        let mut b = make_issue("b", "ENG-B", "todo");
+        b.blocked_by = vec![BlockerRef {
+            id: None,
+            identifier: Some("ENG-X".to_string()),
+            state: Some("todo".to_string()),
+        }];
+
+        let counts = compute_transitive_block_counts(&[b], &terminal());
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn block_counts_disjoint_subgraphs() {
+        // A->B->C and D->E  =>  A: 2, B: 1, D: 1
+        let a = make_issue("a", "ENG-A", "todo");
+        let mut b = make_issue("b", "ENG-B", "todo");
+        b.blocked_by = vec![BlockerRef {
+            id: None,
+            identifier: Some("ENG-A".to_string()),
+            state: Some("todo".to_string()),
+        }];
+        let mut c = make_issue("c", "ENG-C", "todo");
+        c.blocked_by = vec![BlockerRef {
+            id: None,
+            identifier: Some("ENG-B".to_string()),
+            state: Some("todo".to_string()),
+        }];
+        let d = make_issue("d", "ENG-D", "todo");
+        let mut e = make_issue("e", "ENG-E", "todo");
+        e.blocked_by = vec![BlockerRef {
+            id: None,
+            identifier: Some("ENG-D".to_string()),
+            state: Some("todo".to_string()),
+        }];
+
+        let counts = compute_transitive_block_counts(&[a, b, c, d, e], &terminal());
+        assert_eq!(counts.get("ENG-A").copied().unwrap_or(0), 2);
+        // B is not a root (blocked by A).
+        assert_eq!(counts.get("ENG-B").copied().unwrap_or(0), 0);
+        assert_eq!(counts.get("ENG-D").copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn sort_block_count_is_primary_key() {
+        // A: block_count=3, priority=4; B: block_count=0, priority=1
+        // Block count should win over priority.
+        let mut a = make_issue("a", "ENG-A", "todo");
+        a.priority = Some(4);
+        let mut b = make_issue("b", "ENG-B", "todo");
+        b.priority = Some(1);
+
+        let mut counts = HashMap::new();
+        counts.insert("ENG-A".to_string(), 3usize);
+
+        let mut issues = vec![b, a];
+        sort_candidates(&mut issues, &counts);
+        assert_eq!(issues[0].identifier, "ENG-A"); // higher block count first
+        assert_eq!(issues[1].identifier, "ENG-B");
+    }
+
+    #[test]
+    fn sort_block_count_tie_falls_through_to_priority() {
+        let mut a = make_issue("a", "ENG-A", "todo");
+        a.priority = Some(3);
+        let mut b = make_issue("b", "ENG-B", "todo");
+        b.priority = Some(1);
+
+        // Both have same block count (0).
+        let mut issues = vec![a, b];
+        sort_candidates(&mut issues, &HashMap::new());
+        assert_eq!(issues[0].identifier, "ENG-B"); // lower priority number first
+        assert_eq!(issues[1].identifier, "ENG-A");
     }
 }
