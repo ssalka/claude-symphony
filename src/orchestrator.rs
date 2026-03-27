@@ -356,6 +356,7 @@ impl Orchestrator {
 
         // In plan mode, only dispatch issues with the "needs plan" label,
         // and skip issues that already have planning labels.
+        // In normal mode, skip issues that are pending or in-progress planning.
         if self.plan_mode {
             if !issue.labels.iter().any(|l| l == "needs plan") {
                 return false;
@@ -367,6 +368,12 @@ impl Orchestrator {
             {
                 return false;
             }
+        } else if issue
+            .labels
+            .iter()
+            .any(|l| l == "needs plan" || l == "planning...")
+        {
+            return false;
         }
 
         let state = self.state.lock().await;
@@ -2372,11 +2379,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_mode_does_not_skip_planning_labels() {
+    async fn normal_mode_skips_planning_label() {
         let orch = make_test_orchestrator(); // plan_mode = false
         let config = make_config();
         let mut issue = make_issue("id-1", "ENG-1", "In Progress");
         issue.labels = vec!["planning...".to_string()];
-        assert!(orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config).await);
+    }
+
+    #[tokio::test]
+    async fn normal_mode_skips_needs_plan_label() {
+        let orch = make_test_orchestrator(); // plan_mode = false
+        let config = make_config();
+        let mut issue = make_issue("id-1", "ENG-1", "In Progress");
+        issue.labels = vec!["needs plan".to_string()];
+        assert!(!orch.is_eligible(&issue, &config).await);
     }
 }
