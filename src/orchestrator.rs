@@ -700,6 +700,11 @@ impl Orchestrator {
                     state.claude_totals.input_tokens += delta_in;
                     state.claude_totals.output_tokens += delta_out;
                     state.claude_totals.total_tokens += delta_in + delta_out;
+                    tracing::debug!(
+                        "[{identifier}] Tokens: input={input_tokens}, output={output_tokens} (totals: input={}, output={})",
+                        state.claude_totals.input_tokens,
+                        state.claude_totals.output_tokens,
+                    );
                 }
                 ("usage_update".to_string(), None)
             }
@@ -732,7 +737,7 @@ impl Orchestrator {
                 total_cost_usd,
                 ..
             } => {
-                tracing::trace!(
+                tracing::debug!(
                     "[{identifier}] Turn {}: {}ms, ${:.4}",
                     if success { "completed" } else { "failed" },
                     duration_ms.unwrap_or(0),
@@ -779,7 +784,7 @@ impl Orchestrator {
         max_backoff_ms: u64,
         review_state: Option<String>,
     ) {
-        let (attempt, identifier, elapsed_secs) = {
+        let (attempt, identifier, elapsed_secs, input_tokens, output_tokens) = {
             let mut state = self.state.lock().await;
 
             // Ignore exits from stale workers (e.g. old worker cancelled by
@@ -806,8 +811,13 @@ impl Orchestrator {
                 .as_ref()
                 .map(|e| e.issue.identifier.clone())
                 .unwrap_or_default();
+            let (input_tokens, output_tokens) = entry
+                .as_ref()
+                .and_then(|e| e.live_session.as_ref())
+                .map(|ls| (ls.input_tokens, ls.output_tokens))
+                .unwrap_or((0, 0));
 
-            (attempt, identifier, elapsed)
+            (attempt, identifier, elapsed, input_tokens, output_tokens)
         };
 
         tracing::info!(
@@ -816,6 +826,14 @@ impl Orchestrator {
             attempt = attempt,
             elapsed_secs = %elapsed_secs,
             "Worker exited"
+        );
+        tracing::debug!(
+            issue_id = %issue_id,
+            identifier = %identifier,
+            elapsed_secs = %format!("{elapsed_secs:.1}"),
+            input_tokens = input_tokens,
+            output_tokens = output_tokens,
+            "Worker finished: token usage and duration"
         );
 
         match reason {
