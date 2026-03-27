@@ -535,6 +535,8 @@ impl Orchestrator {
                     Err(e) => {
                         // Remove "Planning..." label on failure so issue can be retried.
                         let _ = tracker.remove_label(&issue_id_clone, "Planning...").await;
+                        // Re-add "Needs Plan" so the issue is eligible for retry.
+                        let _ = tracker.add_label(&issue_id_clone, "Needs Plan").await;
                         WorkerExitReason::Abnormal {
                             error: e.to_string(),
                         }
