@@ -27,6 +27,8 @@ pub struct AgentRunner {
     pub workflow: Arc<WorkflowDefinition>,
     /// Channel used to forward [`WorkerEvent`]s back to the orchestrator.
     pub event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
+    /// If set, the plan text is injected into the prompt as the `plan` template variable.
+    pub plan: Option<String>,
 }
 
 impl AgentRunner {
@@ -56,7 +58,12 @@ impl AgentRunner {
         let workspace = workspace::create_for_issue(&issue.identifier, &self.config).await?;
 
         // ---- 2. Render prompt -------------------------------------------- //
-        let prompt = prompt::render_prompt(&self.workflow.prompt_template, &issue, Some(attempt))?;
+        let prompt = prompt::render_prompt(
+            &self.workflow.prompt_template,
+            &issue,
+            Some(attempt),
+            self.plan.as_deref(),
+        )?;
 
         // ---- 3. Build runner --------------------------------------------- //
         let session_config = SessionConfig {
@@ -138,6 +145,103 @@ impl AgentRunner {
 
         Ok(())
     }
+
+    /// Run the agent in plan mode. Same as [`run`] but collects assistant text
+    /// output and returns it as the plan.
+    pub async fn run_plan(
+        self,
+        issue: Issue,
+        attempt: u32,
+        cancel_token: CancellationToken,
+    ) -> Result<String> {
+        let workspace = workspace::create_for_issue(&issue.identifier, &self.config).await?;
+
+        let base_prompt = prompt::render_prompt(
+            &self.workflow.prompt_template,
+            &issue,
+            Some(attempt),
+            None,
+        )?;
+
+        let prompt = format!(
+            "You are in PLANNING MODE. Do NOT make any code changes, create branches, or open PRs.\n\
+             Analyze the issue below and produce a detailed implementation plan as markdown.\n\n\
+             {base_prompt}"
+        );
+
+        let session_config = SessionConfig {
+            command: self.config.agent_command.clone(),
+            workspace_path: workspace.path.clone(),
+            turn_timeout_ms: self.config.agent_turn_timeout_ms,
+        };
+
+        let mut runner = ClaudeRunner::new(session_config);
+
+        let (cancel_watch_tx, mut cancel_watch_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            cancel_token.cancelled().await;
+            let _ = cancel_watch_tx.send(true);
+        });
+
+        let max_turns = self.config.agent_max_turns;
+        let issue_id = issue.id.clone();
+        let event_tx = self.event_tx.clone();
+        let plan_text = Arc::new(tokio::sync::Mutex::new(String::new()));
+
+        let mut turn_count = 0u32;
+        loop {
+            turn_count += 1;
+
+            if *cancel_watch_rx.borrow() {
+                return Err(Error::TurnCancelled);
+            }
+
+            let turn_prompt = if turn_count == 1 {
+                prompt.clone()
+            } else {
+                self.config.agent_continuation_guidance.clone()
+            };
+
+            let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(100);
+
+            let (forward_tx, forward_rx) = tokio::sync::oneshot::channel::<()>();
+            let forward_event_tx = event_tx.clone();
+            let forward_issue_id = issue_id.clone();
+            let plan_collector = Arc::clone(&plan_text);
+            let forward_handle = tokio::spawn(async move {
+                while let Some(event) = agent_rx.recv().await {
+                    // Collect assistant text for the plan.
+                    if let AgentEvent::AssistantText { ref text } = event {
+                        plan_collector.lock().await.push_str(text);
+                    }
+                    let _ = forward_event_tx
+                        .send(WorkerEvent::ClaudeUpdate {
+                            issue_id: forward_issue_id.clone(),
+                            event,
+                        })
+                        .await;
+                }
+                let _ = forward_tx.send(());
+            });
+
+            let turn_result = runner
+                .run_turn(&turn_prompt, &agent_tx, &mut cancel_watch_rx)
+                .await;
+
+            drop(agent_tx);
+            let _ = forward_rx.await;
+            forward_handle.abort();
+
+            turn_result?;
+
+            if turn_count >= max_turns {
+                break;
+            }
+        }
+
+        let result = plan_text.lock().await.clone();
+        Ok(result)
+    }
 }
 
 // -------------------------------------------------------------------------- //
@@ -181,6 +285,8 @@ mod tests {
             terminal_states: vec![],
             active_states_original: vec![],
             terminal_states_original: vec![],
+            planning_states: vec![],
+            planning_states_original: vec![],
             started_state: None,
             review_state: None,
             server_enabled: false,
@@ -223,6 +329,7 @@ mod tests {
             config: make_config(),
             workflow: make_workflow(),
             event_tx,
+            plan: None,
         };
         assert_eq!(runner.config.agent_max_turns, 5);
         assert_eq!(
@@ -238,6 +345,7 @@ mod tests {
             config: make_config(),
             workflow: make_workflow(),
             event_tx,
+            plan: None,
         };
         assert_eq!(runner.config.agent_approval_policy, "auto");
         assert_eq!(runner.config.agent_turn_timeout_ms, 600_000);
@@ -254,10 +362,11 @@ mod tests {
             config: make_config(),
             workflow: make_workflow(),
             event_tx,
+            plan: None,
         };
         let issue = make_issue();
         let rendered =
-            prompt::render_prompt(&runner.workflow.prompt_template, &issue, Some(1)).unwrap();
+            prompt::render_prompt(&runner.workflow.prompt_template, &issue, Some(1), None).unwrap();
         assert_eq!(rendered, "Work on issue ENG-1: Test issue");
     }
 

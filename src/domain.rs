@@ -14,6 +14,14 @@ pub struct BlockerRef {
     pub state: Option<String>,
 }
 
+/// A comment on an issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Comment {
+    pub id: String,
+    pub body: String,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Normalized issue representation (spec §4.1.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Issue {

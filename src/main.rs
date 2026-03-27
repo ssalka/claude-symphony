@@ -36,6 +36,10 @@ struct Args {
     /// Port for HTTP status server (optional)
     #[arg(long)]
     port: Option<u16>,
+
+    /// Run in plan mode: generate plans instead of code changes
+    #[arg(long)]
+    plan: bool,
 }
 
 // -------------------------------------------------------------------------- //
@@ -99,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
         active_states = ?config.active_states,
         poll_interval_ms = config.poll_interval_ms,
         max_concurrent = config.max_concurrent_agents,
+        plan_mode = args.plan,
         "Symphony started"
     );
 
@@ -112,7 +117,8 @@ async fn main() -> anyhow::Result<()> {
     let (refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(10);
 
     // 8. Create orchestrator
-    let orchestrator = Orchestrator::new(initial_workflow, config_rx, tracker, refresh_rx);
+    let orchestrator =
+        Orchestrator::new(initial_workflow, config_rx, tracker, refresh_rx, args.plan);
     let state = Arc::clone(&orchestrator.state);
 
     // 9. Run startup cleanup

@@ -7,7 +7,7 @@
 
 pub mod linear;
 
-use crate::domain::Issue;
+use crate::domain::{Comment, Issue};
 use crate::error::Result;
 
 /// Abstraction over an issue-tracking backend.
@@ -44,4 +44,31 @@ pub trait Tracker: Send + Sync {
         issue_id: &'a str,
         state_name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+    /// Add a label to an issue. Creates the label in the team if it does not exist.
+    fn add_label<'a>(
+        &'a self,
+        issue_id: &'a str,
+        label_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+    /// Remove a label from an issue. No-op if the label is not attached.
+    fn remove_label<'a>(
+        &'a self,
+        issue_id: &'a str,
+        label_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+    /// Post a comment on an issue.
+    fn post_comment<'a>(
+        &'a self,
+        issue_id: &'a str,
+        body: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+    /// Fetch comments on an issue, ordered by creation time.
+    fn fetch_comments<'a>(
+        &'a self,
+        issue_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Comment>>> + Send + 'a>>;
 }

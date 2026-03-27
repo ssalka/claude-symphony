@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::domain::{BlockerRef, Issue};
+use crate::domain::{BlockerRef, Comment, Issue};
 use crate::error::{Error, Result};
 use crate::tracker::Tracker;
 
@@ -110,6 +110,66 @@ query FetchIssueStates($ids: [ID!]!) {
 }
 "#;
 
+const FETCH_TEAM_LABEL_QUERY: &str = r#"
+query FetchTeamLabel($issueId: String!, $labelName: String!) {
+  issue(id: $issueId) {
+    team {
+      id
+      labels(filter: { name: { eq: $labelName } }) {
+        nodes { id }
+      }
+    }
+  }
+}
+"#;
+
+const CREATE_LABEL_MUTATION: &str = r#"
+mutation CreateLabel($teamId: String!, $name: String!) {
+  issueLabelCreate(input: { teamId: $teamId, name: $name }) {
+    success
+    issueLabel { id }
+  }
+}
+"#;
+
+const ADD_LABEL_MUTATION: &str = r#"
+mutation AddLabel($issueId: String!, $labelId: String!) {
+  issueAddLabel(id: $issueId, labelId: $labelId) {
+    success
+  }
+}
+"#;
+
+const REMOVE_LABEL_MUTATION: &str = r#"
+mutation RemoveLabel($issueId: String!, $labelId: String!) {
+  issueRemoveLabel(id: $issueId, labelId: $labelId) {
+    success
+  }
+}
+"#;
+
+const CREATE_COMMENT_MUTATION: &str = r#"
+mutation CreateComment($issueId: String!, $body: String!) {
+  commentCreate(input: { issueId: $issueId, body: $body }) {
+    success
+  }
+}
+"#;
+
+const FETCH_COMMENTS_QUERY: &str = r#"
+query FetchComments($issueId: String!) {
+  issue(id: $issueId) {
+    comments(first: 100) {
+      nodes {
+        id
+        body
+        createdAt
+      }
+    }
+  }
+}
+"#;
+
 // -------------------------------------------------------------------------- //
 // Raw response deserialization types
 // -------------------------------------------------------------------------- //
@@ -193,6 +253,100 @@ struct IssueUpdateResult {
 struct UpdateIssueStateData {
     #[serde(rename = "issueUpdate")]
     issue_update: IssueUpdateResult,
+}
+
+// ---- label operation response types -----------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct RawLabelId {
+    id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawLabelConnection {
+    nodes: Vec<RawLabelId>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TeamWithLabels {
+    id: String,
+    labels: RawLabelConnection,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IssueWithTeamLabels {
+    team: TeamWithLabels,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FetchTeamLabelData {
+    issue: IssueWithTeamLabels,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateLabelResult {
+    success: bool,
+    #[serde(rename = "issueLabel")]
+    issue_label: Option<RawLabelId>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateLabelData {
+    #[serde(rename = "issueLabelCreate")]
+    issue_label_create: CreateLabelResult,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LabelMutationResult {
+    success: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AddLabelData {
+    #[serde(rename = "issueAddLabel")]
+    issue_add_label: LabelMutationResult,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RemoveLabelData {
+    #[serde(rename = "issueRemoveLabel")]
+    issue_remove_label: LabelMutationResult,
+}
+
+// ---- comment operation response types ---------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct CommentMutationResult {
+    success: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateCommentData {
+    #[serde(rename = "commentCreate")]
+    comment_create: CommentMutationResult,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawCommentNode {
+    id: String,
+    body: String,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawCommentConnection {
+    nodes: Vec<RawCommentNode>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IssueWithComments {
+    comments: RawCommentConnection,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FetchCommentsData {
+    issue: IssueWithComments,
 }
 
 /// Full issue node as returned by the candidate/states queries.
@@ -540,6 +694,130 @@ impl LinearClient {
         let nodes = self.fetch_state_page(ids).await?;
         Ok(nodes.into_iter().map(Self::normalize_state_only).collect())
     }
+
+    // ---------------------------------------------------------------------- //
+    // Label operations
+    // ---------------------------------------------------------------------- //
+
+    /// Find the label ID by name in the issue's team, or create it if missing.
+    async fn resolve_or_create_label(
+        &self,
+        issue_id: &str,
+        label_name: &str,
+    ) -> Result<String> {
+        let vars = serde_json::json!({
+            "issueId": issue_id,
+            "labelName": label_name,
+        });
+        let data: FetchTeamLabelData = self.graphql(FETCH_TEAM_LABEL_QUERY, vars).await?;
+        let team_id = data.issue.team.id;
+
+        if let Some(label) = data.issue.team.labels.nodes.into_iter().next() {
+            return Ok(label.id);
+        }
+
+        // Label does not exist — create it.
+        let vars = serde_json::json!({
+            "teamId": team_id,
+            "name": label_name,
+        });
+        let data: CreateLabelData = self.graphql(CREATE_LABEL_MUTATION, vars).await?;
+        if !data.issue_label_create.success {
+            return Err(Error::LinearUnknownPayload {
+                description: format!("issueLabelCreate returned success=false for '{label_name}'"),
+            });
+        }
+        data.issue_label_create
+            .issue_label
+            .map(|l| l.id)
+            .ok_or_else(|| Error::LinearUnknownPayload {
+                description: format!("issueLabelCreate did not return label id for '{label_name}'"),
+            })
+    }
+
+    /// Add a label to an issue. Creates the label in the team if it does not exist.
+    pub async fn add_label_impl(&self, issue_id: &str, label_name: &str) -> Result<()> {
+        let label_id = self.resolve_or_create_label(issue_id, label_name).await?;
+        let vars = serde_json::json!({
+            "issueId": issue_id,
+            "labelId": label_id,
+        });
+        let data: AddLabelData = self.graphql(ADD_LABEL_MUTATION, vars).await?;
+        if !data.issue_add_label.success {
+            return Err(Error::LinearUnknownPayload {
+                description: "issueAddLabel returned success=false".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Remove a label from an issue. No-op if the label is not found.
+    pub async fn remove_label_impl(&self, issue_id: &str, label_name: &str) -> Result<()> {
+        let vars = serde_json::json!({
+            "issueId": issue_id,
+            "labelName": label_name,
+        });
+        let data: FetchTeamLabelData = self.graphql(FETCH_TEAM_LABEL_QUERY, vars).await?;
+
+        let label_id = match data.issue.team.labels.nodes.into_iter().next() {
+            Some(label) => label.id,
+            None => return Ok(()), // Label doesn't exist — nothing to remove.
+        };
+
+        let vars = serde_json::json!({
+            "issueId": issue_id,
+            "labelId": label_id,
+        });
+        let data: RemoveLabelData = self.graphql(REMOVE_LABEL_MUTATION, vars).await?;
+        if !data.issue_remove_label.success {
+            return Err(Error::LinearUnknownPayload {
+                description: "issueRemoveLabel returned success=false".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------- //
+    // Comment operations
+    // ---------------------------------------------------------------------- //
+
+    /// Post a comment on an issue.
+    pub async fn post_comment_impl(&self, issue_id: &str, body: &str) -> Result<()> {
+        let vars = serde_json::json!({
+            "issueId": issue_id,
+            "body": body,
+        });
+        let data: CreateCommentData = self.graphql(CREATE_COMMENT_MUTATION, vars).await?;
+        if !data.comment_create.success {
+            return Err(Error::LinearUnknownPayload {
+                description: "commentCreate returned success=false".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Fetch comments on an issue, ordered by creation time.
+    pub async fn fetch_comments_impl(&self, issue_id: &str) -> Result<Vec<Comment>> {
+        let vars = serde_json::json!({
+            "issueId": issue_id,
+        });
+        let data: FetchCommentsData = self.graphql(FETCH_COMMENTS_QUERY, vars).await?;
+        let comments = data
+            .issue
+            .comments
+            .nodes
+            .into_iter()
+            .map(|n| Comment {
+                id: n.id,
+                body: n.body,
+                created_at: n
+                    .created_at
+                    .as_deref()
+                    .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok()),
+            })
+            .collect();
+        Ok(comments)
+    }
 }
 
 // -------------------------------------------------------------------------- //
@@ -576,6 +854,38 @@ impl Tracker for LinearClient {
         state_name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(self.set_issue_state_impl(issue_id, state_name))
+    }
+
+    fn add_label<'a>(
+        &'a self,
+        issue_id: &'a str,
+        label_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.add_label_impl(issue_id, label_name))
+    }
+
+    fn remove_label<'a>(
+        &'a self,
+        issue_id: &'a str,
+        label_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.remove_label_impl(issue_id, label_name))
+    }
+
+    fn post_comment<'a>(
+        &'a self,
+        issue_id: &'a str,
+        body: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.post_comment_impl(issue_id, body))
+    }
+
+    fn fetch_comments<'a>(
+        &'a self,
+        issue_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Comment>>> + Send + 'a>>
+    {
+        Box::pin(self.fetch_comments_impl(issue_id))
     }
 }
 

@@ -68,7 +68,12 @@ fn blocker_to_value(b: &BlockerRef) -> Value {
 /// * [`Error::TemplateParseError`] – the template string is not valid Liquid.
 /// * [`Error::TemplateRenderError`] – the template failed to render (e.g. a
 ///   filter was applied to an incompatible type).
-pub fn render_prompt(template: &str, issue: &Issue, attempt: Option<u32>) -> Result<String> {
+pub fn render_prompt(
+    template: &str,
+    issue: &Issue,
+    attempt: Option<u32>,
+    plan: Option<&str>,
+) -> Result<String> {
     // Build a parser with the full Liquid standard library.
     let parser =
         liquid::ParserBuilder::with_stdlib()
@@ -154,6 +159,15 @@ pub fn render_prompt(template: &str, issue: &Issue, attempt: Option<u32>) -> Res
         },
     );
 
+    // --- plan ---
+    globals.insert(
+        KString::from_static("plan"),
+        match plan {
+            Some(p) => Value::scalar(p.to_owned()),
+            None => Value::scalar(String::new()),
+        },
+    );
+
     // Render.
     tmpl.render(&globals)
         .map_err(|e| Error::TemplateRenderError {
@@ -202,7 +216,7 @@ mod tests {
         };
 
         let tmpl = "{{ identifier }}: {{ title }} [{{ state }}]";
-        let out = render_prompt(tmpl, &issue, None).unwrap();
+        let out = render_prompt(tmpl, &issue, None, None).unwrap();
         assert_eq!(out, "ENG-99: Fix everything [In Progress]");
     }
 
@@ -213,7 +227,7 @@ mod tests {
             ..base_issue()
         };
 
-        let out = render_prompt("{{ description }}", &issue, None).unwrap();
+        let out = render_prompt("{{ description }}", &issue, None, None).unwrap();
         assert_eq!(out, "A detailed description.");
     }
 
@@ -222,7 +236,7 @@ mod tests {
     #[test]
     fn test_description_none_renders_empty_string() {
         let issue = base_issue(); // description is None
-        let out = render_prompt("desc:{{ description }}", &issue, None).unwrap();
+        let out = render_prompt("desc:{{ description }}", &issue, None, None).unwrap();
         // description should be empty string when None
         assert_eq!(out, "desc:");
     }
@@ -231,7 +245,7 @@ mod tests {
     fn test_priority_none_is_nil() {
         let issue = base_issue(); // priority is None
                                   // Nil renders as empty string in Liquid
-        let out = render_prompt("p:{{ priority }}", &issue, None).unwrap();
+        let out = render_prompt("p:{{ priority }}", &issue, None, None).unwrap();
         assert_eq!(out, "p:");
     }
 
@@ -241,14 +255,14 @@ mod tests {
             priority: Some(2),
             ..base_issue()
         };
-        let out = render_prompt("{{ priority }}", &issue, None).unwrap();
+        let out = render_prompt("{{ priority }}", &issue, None, None).unwrap();
         assert_eq!(out, "2");
     }
 
     #[test]
     fn test_branch_name_none_is_nil() {
         let issue = base_issue();
-        let out = render_prompt("branch:{{ branch_name }}", &issue, None).unwrap();
+        let out = render_prompt("branch:{{ branch_name }}", &issue, None, None).unwrap();
         assert_eq!(out, "branch:");
     }
 
@@ -258,14 +272,14 @@ mod tests {
             branch_name: Some("eng-1-fix".to_string()),
             ..base_issue()
         };
-        let out = render_prompt("{{ branch_name }}", &issue, None).unwrap();
+        let out = render_prompt("{{ branch_name }}", &issue, None, None).unwrap();
         assert_eq!(out, "eng-1-fix");
     }
 
     #[test]
     fn test_url_none_is_nil() {
         let issue = base_issue();
-        let out = render_prompt("url:{{ url }}", &issue, None).unwrap();
+        let out = render_prompt("url:{{ url }}", &issue, None, None).unwrap();
         assert_eq!(out, "url:");
     }
 
@@ -275,7 +289,7 @@ mod tests {
             url: Some("https://linear.app/issue/ENG-1".to_string()),
             ..base_issue()
         };
-        let out = render_prompt("{{ url }}", &issue, None).unwrap();
+        let out = render_prompt("{{ url }}", &issue, None, None).unwrap();
         assert_eq!(out, "https://linear.app/issue/ENG-1");
     }
 
@@ -284,7 +298,7 @@ mod tests {
     #[test]
     fn test_labels_empty() {
         let issue = base_issue();
-        let out = render_prompt("{% for l in labels %}{{l}},{% endfor %}", &issue, None).unwrap();
+        let out = render_prompt("{% for l in labels %}{{l}},{% endfor %}", &issue, None, None).unwrap();
         assert_eq!(out, "");
     }
 
@@ -297,6 +311,7 @@ mod tests {
         let out = render_prompt(
             "{% for l in labels %}{{ l }}{% unless forloop.last %},{% endunless %}{% endfor %}",
             &issue,
+            None,
             None,
         )
         .unwrap();
@@ -311,6 +326,7 @@ mod tests {
         let out = render_prompt(
             "{% for b in blocked_by %}{{ b.identifier }}{% endfor %}",
             &issue,
+            None,
             None,
         )
         .unwrap();
@@ -331,6 +347,7 @@ mod tests {
             "{% for b in blocked_by %}{{ b.id }}|{{ b.identifier }}|{{ b.state }}{% endfor %}",
             &issue,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(out, "blk-1|ENG-10|In Progress");
@@ -349,6 +366,7 @@ mod tests {
         let out = render_prompt(
             "{% for b in blocked_by %}[{{ b.id }}|{{ b.identifier }}|{{ b.state }}]{% endfor %}",
             &issue,
+            None,
             None,
         )
         .unwrap();
@@ -377,6 +395,7 @@ mod tests {
             "{% for b in blocked_by %}{{ b.identifier }}{% unless forloop.last %},{% endunless %}{% endfor %}",
             &issue,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(out, "ENG-5,ENG-6");
@@ -387,21 +406,21 @@ mod tests {
     #[test]
     fn test_attempt_none_is_nil() {
         let issue = base_issue();
-        let out = render_prompt("a:{{ attempt }}", &issue, None).unwrap();
+        let out = render_prompt("a:{{ attempt }}", &issue, None, None).unwrap();
         assert_eq!(out, "a:");
     }
 
     #[test]
     fn test_attempt_some() {
         let issue = base_issue();
-        let out = render_prompt("attempt {{ attempt }}", &issue, Some(3)).unwrap();
+        let out = render_prompt("attempt {{ attempt }}", &issue, Some(3), None).unwrap();
         assert_eq!(out, "attempt 3");
     }
 
     #[test]
     fn test_attempt_first() {
         let issue = base_issue();
-        let out = render_prompt("{{ attempt }}", &issue, Some(1)).unwrap();
+        let out = render_prompt("{{ attempt }}", &issue, Some(1), None).unwrap();
         assert_eq!(out, "1");
     }
 
@@ -410,7 +429,7 @@ mod tests {
     #[test]
     fn test_created_at_none() {
         let issue = base_issue();
-        let out = render_prompt("{{ created_at }}", &issue, None).unwrap();
+        let out = render_prompt("{{ created_at }}", &issue, None, None).unwrap();
         assert_eq!(out, "");
     }
 
@@ -421,7 +440,7 @@ mod tests {
             created_at: Some(Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap()),
             ..base_issue()
         };
-        let out = render_prompt("{{ created_at }}", &issue, None).unwrap();
+        let out = render_prompt("{{ created_at }}", &issue, None, None).unwrap();
         // Should be an ISO-8601 string containing the date portion.
         assert!(out.contains("2024-01-15"), "got: {}", out);
     }
@@ -431,7 +450,7 @@ mod tests {
     #[test]
     fn test_invalid_template_returns_parse_error() {
         let issue = base_issue();
-        let err = render_prompt("{% if %}", &issue, None).unwrap_err();
+        let err = render_prompt("{% if %}", &issue, None, None).unwrap_err();
         match err {
             Error::TemplateParseError { .. } => {}
             other => panic!("expected TemplateParseError, got {:?}", other),
@@ -443,7 +462,7 @@ mod tests {
         // Applying an arithmetic filter to a non-numeric value should produce a
         // render error.
         let issue = base_issue(); // title = "Test issue" (string)
-        let err = render_prompt("{{ title | divided_by: 0 }}", &issue, None).unwrap_err();
+        let err = render_prompt("{{ title | divided_by: 0 }}", &issue, None, None).unwrap_err();
         // divided_by: 0 causes a render-time error in liquid
         match err {
             Error::TemplateRenderError { .. } | Error::TemplateParseError { .. } => {}
@@ -465,10 +484,10 @@ mod tests {
         let issue_without = base_issue();
         let tmpl = "{% if priority %}P{{ priority }}{% else %}no-priority{% endif %}";
 
-        let with_out = render_prompt(tmpl, &issue_with, None).unwrap();
+        let with_out = render_prompt(tmpl, &issue_with, None, None).unwrap();
         assert_eq!(with_out, "P1");
 
-        let without_out = render_prompt(tmpl, &issue_without, None).unwrap();
+        let without_out = render_prompt(tmpl, &issue_without, None, None).unwrap();
         assert_eq!(without_out, "no-priority");
     }
 
@@ -503,7 +522,7 @@ Labels: {% for l in labels %}{{ l }}{% unless forloop.last %}, {% endunless %}{%
 Blocked by: {% for b in blocked_by %}{{ b.identifier }}({{ b.state }}){% endfor %}
 Attempt: {{ attempt }}"#;
 
-        let out = render_prompt(tmpl, &issue, Some(2)).unwrap();
+        let out = render_prompt(tmpl, &issue, Some(2), None).unwrap();
         assert!(out.contains("Issue ENG-42: Implement feature X"));
         assert!(out.contains("State: In Progress"));
         assert!(out.contains("Branch: eng-42-feature-x"));
@@ -511,5 +530,32 @@ Attempt: {{ attempt }}"#;
         assert!(out.contains("Labels: feature, backend"));
         assert!(out.contains("Blocked by: ENG-10(In Review)"));
         assert!(out.contains("Attempt: 2"));
+    }
+
+    // ---- plan variable ------------------------------------------------------ //
+
+    #[test]
+    fn test_plan_none_renders_empty() {
+        let issue = base_issue();
+        let out = render_prompt("plan:{{ plan }}", &issue, None, None).unwrap();
+        assert_eq!(out, "plan:");
+    }
+
+    #[test]
+    fn test_plan_some_renders_text() {
+        let issue = base_issue();
+        let out =
+            render_prompt("plan:{{ plan }}", &issue, None, Some("My plan")).unwrap();
+        assert_eq!(out, "plan:My plan");
+    }
+
+    #[test]
+    fn test_plan_conditional() {
+        let issue = base_issue();
+        let tmpl = "{% if plan != '' %}PLAN: {{ plan }}{% else %}no plan{% endif %}";
+        let with = render_prompt(tmpl, &issue, None, Some("Do X")).unwrap();
+        assert_eq!(with, "PLAN: Do X");
+        let without = render_prompt(tmpl, &issue, None, None).unwrap();
+        assert_eq!(without, "no plan");
     }
 }

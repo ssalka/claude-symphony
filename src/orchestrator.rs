@@ -30,6 +30,7 @@ pub struct Orchestrator {
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
     event_rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
     refresh_rx: tokio::sync::mpsc::Receiver<()>,
+    plan_mode: bool,
 }
 
 impl Orchestrator {
@@ -46,6 +47,7 @@ impl Orchestrator {
         config_rx: tokio::sync::watch::Receiver<Arc<WorkflowDefinition>>,
         tracker: Arc<dyn Tracker + Send + Sync>,
         refresh_rx: tokio::sync::mpsc::Receiver<()>,
+        plan_mode: bool,
     ) -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel::<WorkerEvent>(256);
 
@@ -75,6 +77,7 @@ impl Orchestrator {
             event_tx,
             event_rx,
             refresh_rx,
+            plan_mode,
         }
     }
 
@@ -145,14 +148,16 @@ impl Orchestrator {
             self.reconcile(&config).await;
 
             // 4. Validate dispatch config.
-            if let Err(e) = config.validate_for_dispatch() {
+            if let Err(e) = config.validate_for_dispatch(self.plan_mode) {
                 tracing::warn!(error = %e, "Config not ready for dispatch; skipping this tick");
             } else {
-                // 5. Fetch candidates.
+                // 5. Fetch candidates using effective active states.
+                let (_, effective_states_original) =
+                    config.effective_active_states(self.plan_mode);
                 let mut candidates = match self
                     .tracker
                     .fetch_candidate_issues(
-                        &config.active_states_original,
+                        effective_states_original,
                         &config.tracker_project_slugs,
                     )
                     .await
@@ -338,13 +343,24 @@ impl Orchestrator {
 
         let state_lc = issue.state.to_lowercase();
 
-        // Must be in an active state.
-        if !config.active_states.contains(&state_lc) {
+        // Must be in an effective active state (respects plan_mode).
+        let (effective_states, _) = config.effective_active_states(self.plan_mode);
+        if !effective_states.contains(&state_lc) {
             return false;
         }
 
         // Must NOT be in a terminal state.
         if config.terminal_states.contains(&state_lc) {
+            return false;
+        }
+
+        // In plan mode, skip issues that already have planning labels.
+        if self.plan_mode
+            && issue
+                .labels
+                .iter()
+                .any(|l| l == "planning..." || l == "plan ready")
+        {
             return false;
         }
 
@@ -444,62 +460,162 @@ impl Orchestrator {
             "Dispatching worker"
         );
 
-        // Transition to started_state if configured and the issue isn't already in that state.
-        if let Some(ref started_state) = config.started_state {
-            if issue.state.to_lowercase() != started_state.to_lowercase() {
-                tracing::info!(
-                    issue_id = %issue_id,
-                    identifier = %issue_identifier,
-                    state = %started_state,
-                    "Transitioning issue to started state"
-                );
-                match self.tracker.set_issue_state(&issue_id, started_state).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            issue_id = %issue_id,
-                            identifier = %issue_identifier,
-                            state = %started_state,
-                            "Issue transitioned to started state"
-                        );
+        if self.plan_mode {
+            // --- Plan mode dispatch ---
+            // No started_state transition in plan mode.
+            let tracker = Arc::clone(&self.tracker);
+            let runner = AgentRunner {
+                config: Arc::new(config.clone()),
+                workflow: Arc::clone(&self.config_rx.borrow()),
+                event_tx: self.event_tx.clone(),
+                plan: None,
+            };
+            let issue_id_clone = issue_id.clone();
+            let issue_identifier_clone = issue_identifier.clone();
+            let event_tx = self.event_tx.clone();
+
+            tokio::spawn(async move {
+                // 1. Add "Planning..." label.
+                if let Err(e) = tracker.add_label(&issue_id_clone, "Planning...").await {
+                    tracing::warn!(
+                        issue_id = %issue_id_clone,
+                        identifier = %issue_identifier_clone,
+                        error = %e,
+                        "Failed to add Planning... label"
+                    );
+                }
+
+                // 2. Run agent in plan mode.
+                let result = runner.run_plan(issue, attempt, cancel_token).await;
+
+                let reason = match result {
+                    Ok(plan_text) => {
+                        // 3. Post plan as comment (with sentinel marker).
+                        let comment_body =
+                            format!("<!-- symphony-plan -->\n{plan_text}");
+                        if let Err(e) = tracker.post_comment(&issue_id_clone, &comment_body).await {
+                            tracing::error!(
+                                issue_id = %issue_id_clone,
+                                error = %e,
+                                "Failed to post plan comment"
+                            );
+                        }
+
+                        // 4. Swap labels: remove "Planning...", add "Plan Ready".
+                        if let Err(e) = tracker.remove_label(&issue_id_clone, "Planning...").await {
+                            tracing::warn!(issue_id = %issue_id_clone, error = %e, "Failed to remove Planning... label");
+                        }
+                        if let Err(e) = tracker.add_label(&issue_id_clone, "Plan Ready").await {
+                            tracing::warn!(issue_id = %issue_id_clone, error = %e, "Failed to add Plan Ready label");
+                        }
+
+                        WorkerExitReason::Normal
+                    }
+                    Err(e) => {
+                        // Remove "Planning..." label on failure so issue can be retried.
+                        let _ = tracker.remove_label(&issue_id_clone, "Planning...").await;
+                        WorkerExitReason::Abnormal {
+                            error: e.to_string(),
+                        }
+                    }
+                };
+
+                let _ = event_tx
+                    .send(WorkerEvent::WorkerExited {
+                        issue_id: issue_id_clone,
+                        dispatch_id,
+                        reason,
+                    })
+                    .await;
+            });
+        } else {
+            // --- Normal mode dispatch ---
+            // Transition to started_state if configured and the issue isn't already in that state.
+            if let Some(ref started_state) = config.started_state {
+                if issue.state.to_lowercase() != started_state.to_lowercase() {
+                    tracing::info!(
+                        issue_id = %issue_id,
+                        identifier = %issue_identifier,
+                        state = %started_state,
+                        "Transitioning issue to started state"
+                    );
+                    match self.tracker.set_issue_state(&issue_id, started_state).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                issue_id = %issue_id,
+                                identifier = %issue_identifier,
+                                state = %started_state,
+                                "Issue transitioned to started state"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                issue_id = %issue_id,
+                                identifier = %issue_identifier,
+                                state = %started_state,
+                                error = %e,
+                                "Failed to transition issue to started state; continuing dispatch"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // If issue has "plan ready" label, fetch the plan and inject it.
+            let plan = if issue.labels.iter().any(|l| l == "plan ready") {
+                match self.tracker.fetch_comments(&issue_id).await {
+                    Ok(comments) => {
+                        // Find the most recent comment with the symphony-plan sentinel.
+                        comments
+                            .iter()
+                            .rev()
+                            .find(|c| c.body.contains("<!-- symphony-plan -->"))
+                            .map(|c| {
+                                c.body
+                                    .replace("<!-- symphony-plan -->\n", "")
+                                    .replace("<!-- symphony-plan -->", "")
+                            })
                     }
                     Err(e) => {
                         tracing::warn!(
                             issue_id = %issue_id,
-                            identifier = %issue_identifier,
-                            state = %started_state,
                             error = %e,
-                            "Failed to transition issue to started state; continuing dispatch"
+                            "Failed to fetch plan comments; proceeding without plan"
                         );
+                        None
                     }
                 }
-            }
-        }
-
-        // Spawn worker task.
-        let runner = AgentRunner {
-            config: Arc::new(config.clone()),
-            workflow: Arc::clone(&self.config_rx.borrow()),
-            event_tx: self.event_tx.clone(),
-        };
-        let issue_id_clone = issue_id.clone();
-        let event_tx = self.event_tx.clone();
-
-        tokio::spawn(async move {
-            let result = runner.run(issue, attempt, cancel_token).await;
-            let reason = match result {
-                Ok(()) => WorkerExitReason::Normal,
-                Err(e) => WorkerExitReason::Abnormal {
-                    error: e.to_string(),
-                },
+            } else {
+                None
             };
-            let _ = event_tx
-                .send(WorkerEvent::WorkerExited {
-                    issue_id: issue_id_clone,
-                    dispatch_id,
-                    reason,
-                })
-                .await;
-        });
+
+            // Spawn worker task.
+            let runner = AgentRunner {
+                config: Arc::new(config.clone()),
+                workflow: Arc::clone(&self.config_rx.borrow()),
+                event_tx: self.event_tx.clone(),
+                plan,
+            };
+            let issue_id_clone = issue_id.clone();
+            let event_tx = self.event_tx.clone();
+
+            tokio::spawn(async move {
+                let result = runner.run(issue, attempt, cancel_token).await;
+                let reason = match result {
+                    Ok(()) => WorkerExitReason::Normal,
+                    Err(e) => WorkerExitReason::Abnormal {
+                        error: e.to_string(),
+                    },
+                };
+                let _ = event_tx
+                    .send(WorkerEvent::WorkerExited {
+                        issue_id: issue_id_clone,
+                        dispatch_id,
+                        reason,
+                    })
+                    .await;
+            });
+        }
     }
 
     // ---------------------------------------------------------------------- //
@@ -693,6 +809,18 @@ impl Orchestrator {
         );
 
         match reason {
+            WorkerExitReason::Normal if self.plan_mode => {
+                // In plan mode, normal exit means the plan was posted successfully.
+                // Mark completed and remove from claimed — no review_state transition.
+                tracing::info!(
+                    issue_id = %issue_id,
+                    identifier = %identifier,
+                    "Plan worker completed; marking issue as completed"
+                );
+                let mut state = self.state.lock().await;
+                state.completed.insert(issue_id.to_string());
+                state.claimed.remove(issue_id);
+            }
             WorkerExitReason::Normal => {
                 if let Some(ref state_name) = review_state {
                     tracing::info!(
@@ -956,7 +1084,7 @@ pub fn compute_backoff(attempt: u32, max_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::BlockerRef;
+    use crate::domain::{BlockerRef, Comment};
     use chrono::TimeZone;
     use std::collections::HashMap;
     use tokio_util::sync::CancellationToken;
@@ -1008,6 +1136,8 @@ mod tests {
             terminal_states: vec!["done".to_string(), "cancelled".to_string()],
             active_states_original: vec!["In Progress".to_string(), "Todo".to_string()],
             terminal_states_original: vec!["Done".to_string(), "Cancelled".to_string()],
+            planning_states: vec![],
+            planning_states_original: vec![],
             started_state: None,
             review_state: None,
             server_enabled: false,
@@ -1195,6 +1325,49 @@ mod tests {
             > {
                 Box::pin(async { Ok(()) })
             }
+
+            fn add_label<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn remove_label<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn post_comment<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn fetch_comments<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
         }
 
         let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
@@ -1214,6 +1387,7 @@ mod tests {
             config_rx,
             Arc::new(NullTracker),
             refresh_rx,
+            false,
         )
     }
 
@@ -1471,6 +1645,49 @@ mod tests {
                     Ok(())
                 })
             }
+
+            fn add_label<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn remove_label<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn post_comment<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn fetch_comments<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
         }
 
         let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
@@ -1493,6 +1710,7 @@ mod tests {
             config_rx,
             tracker,
             refresh_rx,
+            false,
         );
 
         // Seed a running entry so handle_worker_exit finds it.
@@ -1601,6 +1819,49 @@ mod tests {
                     Ok(())
                 })
             }
+
+            fn add_label<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn remove_label<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn post_comment<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn fetch_comments<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
         }
 
         let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
@@ -1623,6 +1884,7 @@ mod tests {
             config_rx,
             tracker,
             refresh_rx,
+            false,
         );
 
         let mut config = make_config();
@@ -1693,6 +1955,49 @@ mod tests {
                     Ok(())
                 })
             }
+
+            fn add_label<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn remove_label<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn post_comment<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn fetch_comments<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
         }
 
         let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
@@ -1715,6 +2020,7 @@ mod tests {
             config_rx,
             tracker,
             refresh_rx,
+            false,
         );
 
         let mut config = make_config();
@@ -1903,5 +2209,151 @@ mod tests {
         sort_candidates(&mut issues, &HashMap::new());
         assert_eq!(issues[0].identifier, "ENG-B"); // lower priority number first
         assert_eq!(issues[1].identifier, "ENG-A");
+    }
+
+    // ---------------------------------------------------------------------- //
+    // Plan mode — is_eligible label skipping
+    // ---------------------------------------------------------------------- //
+
+    fn make_plan_mode_orchestrator() -> Orchestrator {
+        use crate::tracker::Tracker;
+
+        struct NullTracker;
+        impl Tracker for NullTracker {
+            fn fetch_candidate_issues<'a>(
+                &'a self,
+                _: &'a [String],
+                _: &'a [String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn fetch_issues_by_states<'a>(
+                &'a self,
+                _: &'a [String],
+                _: &'a [String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn fetch_issue_states_by_ids<'a>(
+                &'a self,
+                _: &'a [String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+
+            fn set_issue_state<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn add_label<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn remove_label<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn post_comment<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn fetch_comments<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+        }
+
+        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
+            config: serde_yaml::Value::Null,
+            prompt_template: String::new(),
+        }));
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
+        std::mem::forget(config_tx);
+
+        Orchestrator::new(
+            WorkflowDefinition {
+                config: serde_yaml::Value::Null,
+                prompt_template: String::new(),
+            },
+            config_rx,
+            Arc::new(NullTracker),
+            refresh_rx,
+            true, // plan_mode = true
+        )
+    }
+
+    #[tokio::test]
+    async fn plan_mode_skips_planning_label() {
+        let orch = make_plan_mode_orchestrator();
+        let config = make_config();
+        let mut issue = make_issue("id-1", "ENG-1", "In Progress");
+        issue.labels = vec!["planning...".to_string()];
+        assert!(!orch.is_eligible(&issue, &config).await);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_skips_plan_ready_label() {
+        let orch = make_plan_mode_orchestrator();
+        let config = make_config();
+        let mut issue = make_issue("id-1", "ENG-1", "In Progress");
+        issue.labels = vec!["plan ready".to_string()];
+        assert!(!orch.is_eligible(&issue, &config).await);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_issue_without_planning_labels() {
+        let orch = make_plan_mode_orchestrator();
+        let config = make_config();
+        let issue = make_issue("id-1", "ENG-1", "In Progress");
+        assert!(orch.is_eligible(&issue, &config).await);
+    }
+
+    #[tokio::test]
+    async fn normal_mode_does_not_skip_planning_labels() {
+        let orch = make_test_orchestrator(); // plan_mode = false
+        let config = make_config();
+        let mut issue = make_issue("id-1", "ENG-1", "In Progress");
+        issue.labels = vec!["planning...".to_string()];
+        assert!(orch.is_eligible(&issue, &config).await);
     }
 }

@@ -38,6 +38,8 @@ pub struct ServiceConfig {
     pub terminal_states: Vec<String>,
     pub active_states_original: Vec<String>,
     pub terminal_states_original: Vec<String>,
+    pub planning_states: Vec<String>,
+    pub planning_states_original: Vec<String>,
     /// If set, the agent will move the issue to this state once it has claimed the issue
     /// (if the issue wasn't already in that state).
     pub started_state: Option<String>,
@@ -259,6 +261,11 @@ impl ServiceConfig {
             .map(parse_state_list_preserve_case)
             .unwrap_or_default();
 
+        let (planning_states, planning_states_original) = orchestrator
+            .get("planning_states")
+            .map(parse_state_list_preserve_case)
+            .unwrap_or_default();
+
         let started_state = opt_str(orchestrator, "started_state").map(str::to_string);
         let review_state = opt_str(orchestrator, "review_state").map(str::to_string);
 
@@ -300,6 +307,8 @@ impl ServiceConfig {
             terminal_states,
             active_states_original,
             terminal_states_original,
+            planning_states,
+            planning_states_original,
             started_state,
             review_state,
             server_enabled,
@@ -311,10 +320,30 @@ impl ServiceConfig {
     // Validation
     // -------------------------------------------------------------------------- //
 
+    /// Return the effective active states for the current mode.
+    ///
+    /// In plan mode, returns `planning_states` if configured, otherwise falls
+    /// back to `active_states` (logging a note). In normal mode, always returns
+    /// `active_states`.
+    pub fn effective_active_states(&self, plan_mode: bool) -> (&[String], &[String]) {
+        if plan_mode {
+            if !self.planning_states.is_empty() {
+                (&self.planning_states, &self.planning_states_original)
+            } else {
+                tracing::info!(
+                    "planning_states not configured; falling back to active_states for plan mode"
+                );
+                (&self.active_states, &self.active_states_original)
+            }
+        } else {
+            (&self.active_states, &self.active_states_original)
+        }
+    }
+
     /// Check that all fields required to dispatch work are present and valid.
     ///
     /// Returns the first validation error found, or `Ok(())`.
-    pub fn validate_for_dispatch(&self) -> Result<()> {
+    pub fn validate_for_dispatch(&self, plan_mode: bool) -> Result<()> {
         if self.tracker_kind != "linear" {
             return Err(Error::UnsupportedTrackerKind {
                 kind: self.tracker_kind.clone(),
@@ -331,7 +360,8 @@ impl ServiceConfig {
                 command: String::new(),
             });
         }
-        if self.active_states.is_empty() {
+        let (effective_states, _) = self.effective_active_states(plan_mode);
+        if effective_states.is_empty() {
             return Err(Error::ConfigValidation {
                 message: "orchestrator.active_states is empty; no issues will be fetched".into(),
             });
@@ -647,7 +677,7 @@ orchestrator:
     fn test_validate_for_dispatch_ok() {
         let yaml = minimal_yaml("good-key");
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
-        assert!(cfg.validate_for_dispatch().is_ok());
+        assert!(cfg.validate_for_dispatch(false).is_ok());
     }
 
     #[test]
@@ -666,7 +696,7 @@ agent:
         )
         .unwrap();
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
-        let err = cfg.validate_for_dispatch().unwrap_err();
+        let err = cfg.validate_for_dispatch(false).unwrap_err();
         assert!(matches!(
             err,
             crate::error::Error::UnsupportedTrackerKind { .. }
@@ -689,7 +719,7 @@ agent:
         )
         .unwrap();
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
-        let err = cfg.validate_for_dispatch().unwrap_err();
+        let err = cfg.validate_for_dispatch(false).unwrap_err();
         assert!(matches!(err, crate::error::Error::MissingTrackerApiKey));
     }
 
@@ -709,7 +739,7 @@ agent:
         )
         .unwrap();
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
-        let err = cfg.validate_for_dispatch().unwrap_err();
+        let err = cfg.validate_for_dispatch(false).unwrap_err();
         assert!(matches!(
             err,
             crate::error::Error::MissingTrackerProjectSlug
@@ -732,7 +762,7 @@ agent:
         )
         .unwrap();
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
-        let err = cfg.validate_for_dispatch().unwrap_err();
+        let err = cfg.validate_for_dispatch(false).unwrap_err();
         assert!(matches!(err, crate::error::Error::ClaudeNotFound { .. }));
     }
 
@@ -752,7 +782,7 @@ agent:
         )
         .unwrap();
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
-        let err = cfg.validate_for_dispatch().unwrap_err();
+        let err = cfg.validate_for_dispatch(false).unwrap_err();
         assert!(matches!(err, crate::error::Error::ConfigValidation { .. }));
     }
 
@@ -816,5 +846,109 @@ agent:
             cfg.tracker_endpoint.as_deref(),
             Some("https://api.example.com/graphql")
         );
+    }
+
+    // ---- planning_states ----------------------------------------------------
+
+    #[test]
+    fn test_planning_states_parsed() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+tracker:
+  kind: linear
+  api_key: k
+  project_slugs: [p]
+workspace:
+  root: /tmp
+agent:
+  command: claude
+orchestrator:
+  active_states:
+    - In Progress
+  planning_states:
+    - Backlog
+    - Todo
+"#,
+        )
+        .unwrap();
+        let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
+        assert_eq!(cfg.planning_states, vec!["backlog", "todo"]);
+        assert_eq!(cfg.planning_states_original, vec!["Backlog", "Todo"]);
+    }
+
+    #[test]
+    fn test_planning_states_empty_by_default() {
+        let yaml = minimal_yaml("key");
+        let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
+        assert!(cfg.planning_states.is_empty());
+        assert!(cfg.planning_states_original.is_empty());
+    }
+
+    #[test]
+    fn test_effective_active_states_normal_mode() {
+        let yaml = minimal_yaml("key");
+        let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
+        let (states, _) = cfg.effective_active_states(false);
+        assert_eq!(states, &cfg.active_states);
+    }
+
+    #[test]
+    fn test_effective_active_states_plan_mode_with_planning_states() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+tracker:
+  kind: linear
+  api_key: k
+  project_slugs: [p]
+workspace:
+  root: /tmp
+agent:
+  command: claude
+orchestrator:
+  active_states:
+    - In Progress
+  planning_states:
+    - Backlog
+"#,
+        )
+        .unwrap();
+        let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
+        let (states, original) = cfg.effective_active_states(true);
+        assert_eq!(states, &["backlog"]);
+        assert_eq!(original, &["Backlog"]);
+    }
+
+    #[test]
+    fn test_effective_active_states_plan_mode_fallback() {
+        let yaml = minimal_yaml("key");
+        let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
+        // No planning_states configured — should fall back to active_states.
+        let (states, _) = cfg.effective_active_states(true);
+        assert_eq!(states, &cfg.active_states);
+    }
+
+    #[test]
+    fn test_validate_for_dispatch_plan_mode_with_planning_states() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+tracker:
+  kind: linear
+  api_key: k
+  project_slugs: [p]
+workspace:
+  root: /tmp
+agent:
+  command: claude
+orchestrator:
+  planning_states:
+    - Backlog
+"#,
+        )
+        .unwrap();
+        let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
+        // active_states is empty, but planning_states is set — plan mode should pass.
+        assert!(cfg.validate_for_dispatch(true).is_ok());
+        // Normal mode should fail because active_states is empty.
+        assert!(cfg.validate_for_dispatch(false).is_err());
     }
 }
