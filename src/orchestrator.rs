@@ -354,14 +354,19 @@ impl Orchestrator {
             return false;
         }
 
-        // In plan mode, skip issues that already have planning labels.
-        if self.plan_mode
-            && issue
+        // In plan mode, only dispatch issues with the "needs plan" label,
+        // and skip issues that already have planning labels.
+        if self.plan_mode {
+            if !issue.labels.iter().any(|l| l == "needs plan") {
+                return false;
+            }
+            if issue
                 .labels
                 .iter()
                 .any(|l| l == "planning..." || l == "plan ready")
-        {
-            return false;
+            {
+                return false;
+            }
         }
 
         let state = self.state.lock().await;
@@ -475,7 +480,15 @@ impl Orchestrator {
             let event_tx = self.event_tx.clone();
 
             tokio::spawn(async move {
-                // 1. Add "Planning..." label.
+                // 1. Remove "Needs Plan" label and add "Planning..." label.
+                if let Err(e) = tracker.remove_label(&issue_id_clone, "Needs Plan").await {
+                    tracing::warn!(
+                        issue_id = %issue_id_clone,
+                        identifier = %issue_identifier_clone,
+                        error = %e,
+                        "Failed to remove Needs Plan label"
+                    );
+                }
                 if let Err(e) = tracker.add_label(&issue_id_clone, "Planning...").await {
                     tracing::warn!(
                         issue_id = %issue_id_clone,
@@ -2327,7 +2340,7 @@ mod tests {
         let orch = make_plan_mode_orchestrator();
         let config = make_config();
         let mut issue = make_issue("id-1", "ENG-1", "In Progress");
-        issue.labels = vec!["planning...".to_string()];
+        issue.labels = vec!["needs plan".to_string(), "planning...".to_string()];
         assert!(!orch.is_eligible(&issue, &config).await);
     }
 
@@ -2336,15 +2349,25 @@ mod tests {
         let orch = make_plan_mode_orchestrator();
         let config = make_config();
         let mut issue = make_issue("id-1", "ENG-1", "In Progress");
-        issue.labels = vec!["plan ready".to_string()];
+        issue.labels = vec!["needs plan".to_string(), "plan ready".to_string()];
         assert!(!orch.is_eligible(&issue, &config).await);
     }
 
     #[tokio::test]
-    async fn plan_mode_allows_issue_without_planning_labels() {
+    async fn plan_mode_requires_needs_plan_label() {
         let orch = make_plan_mode_orchestrator();
         let config = make_config();
         let issue = make_issue("id-1", "ENG-1", "In Progress");
+        // No "needs plan" label — should be ineligible.
+        assert!(!orch.is_eligible(&issue, &config).await);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_issue_with_needs_plan_label() {
+        let orch = make_plan_mode_orchestrator();
+        let config = make_config();
+        let mut issue = make_issue("id-1", "ENG-1", "In Progress");
+        issue.labels = vec!["needs plan".to_string()];
         assert!(orch.is_eligible(&issue, &config).await);
     }
 
