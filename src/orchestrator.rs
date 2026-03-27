@@ -266,13 +266,14 @@ impl Orchestrator {
                 let mut ids_to_kill: Vec<String> = Vec::new();
                 let mut ids_to_update: Vec<(String, String)> = Vec::new(); // (id, new_state)
 
+                let (effective_states, _) = config.effective_active_states(self.plan_mode);
                 {
                     let state = self.state.lock().await;
                     for issue in &current_issues {
                         let issue_state_lc = issue.state.to_lowercase();
                         if config.terminal_states.contains(&issue_state_lc) {
                             ids_to_kill.push(issue.id.clone());
-                        } else if config.active_states.contains(&issue_state_lc) {
+                        } else if effective_states.contains(&issue_state_lc) {
                             ids_to_update.push((issue.id.clone(), issue.state.clone()));
                         } else {
                             // Unrecognized state — kill without cleanup.
