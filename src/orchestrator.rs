@@ -11,6 +11,7 @@ use crate::domain::{
     truncate, AgentEvent, Issue, LiveSession, OrchestratorState, RetryEntry, RunningEntry,
     WorkerEvent, WorkerExitReason, WorkflowDefinition,
 };
+use crate::scheduling::{compute_backoff, compute_transitive_block_counts, sort_candidates};
 use crate::tracker::Tracker;
 use crate::workspace;
 
@@ -123,10 +124,7 @@ impl Orchestrator {
         loop {
             tracing::debug!("Poll tick starting");
 
-            // 1. Drain incoming WorkerEvents.
-            self.process_events().await;
-
-            // 2. Get current config snapshot.
+            // 1. Get current config snapshot.
             let workflow = self.config_rx.borrow().clone();
             let config = match ServiceConfig::from_yaml(&workflow.config) {
                 Ok(c) => c,
@@ -136,6 +134,9 @@ impl Orchestrator {
                     continue;
                 }
             };
+
+            // 2. Drain incoming WorkerEvents.
+            self.process_events(&config).await;
 
             // Update state with current config values.
             {
@@ -152,7 +153,7 @@ impl Orchestrator {
                 tracing::warn!(error = %e, "Config not ready for dispatch; skipping this tick");
             } else {
                 // 5. Fetch candidates using effective active states.
-                let (_, effective_states_original) =
+                let (effective_states, effective_states_original) =
                     config.effective_active_states(self.plan_mode);
                 let mut candidates = match self
                     .tracker
@@ -186,7 +187,7 @@ impl Orchestrator {
 
                 // 7. Dispatch eligible issues.
                 for issue in candidates {
-                    if self.is_eligible(&issue, &config).await {
+                    if self.is_eligible(&issue, &config, effective_states).await {
                         self.dispatch(issue, &config).await;
                     }
                 }
@@ -209,13 +210,17 @@ impl Orchestrator {
 
     /// Reconcile the running set against the tracker's current issue states.
     ///
-    /// Part A: stall detection (log-only — see self-review for limitation).
+    /// Part A: stall detection — cancel agents that appear stalled.
     /// Part B: fetch current state of running issues from tracker and cancel
-    ///         any that have moved to a terminal state.
+    ///         any that have moved to a terminal or unrecognized state.
     async fn reconcile(&mut self, config: &ServiceConfig) {
-        // --- Part A: stall detection ----------------------------------------
+        let running_ids: Vec<String>;
+
+        // --- Part A: stall detection + collect running IDs (single lock) -----
         {
             let state = self.state.lock().await;
+            running_ids = state.running.keys().cloned().collect();
+
             for (id, entry) in state.running.iter() {
                 let elapsed_ms = entry.started_at.elapsed().as_millis() as u64;
 
@@ -242,53 +247,41 @@ impl Orchestrator {
                         stall_timeout_ms = config.agent_stall_timeout_ms,
                         "Agent appears stalled; cancelling"
                     );
-                    // CancellationToken::cancel() takes &self, so we can call it
-                    // without removing the entry. The worker will exit and
-                    // handle_worker_exit will clean up and schedule a retry.
                     entry.cancel_token.cancel();
                 }
             }
         }
 
-        // --- Part B: state refresh from tracker -----------------------------
-        let running_ids: Vec<String> = {
-            let state = self.state.lock().await;
-            state.running.keys().cloned().collect()
-        };
-
         if running_ids.is_empty() {
             return;
         }
 
+        // --- Part B: state refresh from tracker ------------------------------
         match self.tracker.fetch_issue_states_by_ids(&running_ids).await {
             Ok(current_issues) => {
-                // Collect IDs to kill before mutating state.
                 let mut ids_to_kill: Vec<String> = Vec::new();
-                let mut ids_to_update: Vec<(String, String)> = Vec::new(); // (id, new_state)
+                let mut ids_to_update: Vec<(String, String)> = Vec::new();
 
+                // Classify issues — no lock needed, only reads config.
                 let (effective_states, _) = config.effective_active_states(self.plan_mode);
-                {
-                    let state = self.state.lock().await;
-                    for issue in &current_issues {
-                        let issue_state_lc = issue.state.to_lowercase();
-                        if config.terminal_states.contains(&issue_state_lc) {
-                            ids_to_kill.push(issue.id.clone());
-                        } else if effective_states.contains(&issue_state_lc) {
-                            ids_to_update.push((issue.id.clone(), issue.state.clone()));
-                        } else {
-                            // Unrecognized state — kill without cleanup.
-                            tracing::warn!(
-                                issue_id = %issue.id,
-                                state = %issue.state,
-                                "Running issue moved to unrecognized state; cancelling"
-                            );
-                            ids_to_kill.push(issue.id.clone());
-                        }
-                        let _ = state; // just needed for scope
+                for issue in &current_issues {
+                    let issue_state_lc = issue.state.to_lowercase();
+                    if config.terminal_states.contains(&issue_state_lc) {
+                        ids_to_kill.push(issue.id.clone());
+                    } else if effective_states.contains(&issue_state_lc) {
+                        ids_to_update.push((issue.id.clone(), issue.state.clone()));
+                    } else {
+                        tracing::warn!(
+                            issue_id = %issue.id,
+                            state = %issue.state,
+                            "Running issue moved to unrecognized state; cancelling"
+                        );
+                        ids_to_kill.push(issue.id.clone());
                     }
                 }
 
-                // Apply state updates.
+                // Apply updates and collect entries to kill (single lock).
+                let entries_to_cancel: Vec<(String, RunningEntry)>;
                 {
                     let mut state = self.state.lock().await;
                     for (id, new_state) in ids_to_update {
@@ -296,29 +289,27 @@ impl Orchestrator {
                             entry.issue.state = new_state;
                         }
                     }
+
+                    entries_to_cancel = ids_to_kill
+                        .into_iter()
+                        .filter_map(|id| {
+                            let entry = state.running.remove(&id)?;
+                            state.completed.insert(id.clone());
+                            state.claimed.remove(&id);
+                            Some((id, entry))
+                        })
+                        .collect();
                 }
 
-                // Kill terminal/unrecognized issues: take ownership of entry,
-                // fire cancel_tx, add to completed.
-                for id in ids_to_kill {
-                    let entry = {
-                        let mut state = self.state.lock().await;
-                        state.running.remove(&id)
-                    };
-                    if let Some(entry) = entry {
-                        tracing::info!(
-                            issue_id = %id,
-                            identifier = %entry.issue.identifier,
-                            state = %entry.issue.state,
-                            "Reconcile: cancelling running agent (issue reached terminal/unknown state)"
-                        );
-                        // Signal cancellation.
-                        entry.cancel_token.cancel();
-
-                        let mut state = self.state.lock().await;
-                        state.completed.insert(id.clone());
-                        state.claimed.remove(&id);
-                    }
+                // Cancel outside the lock.
+                for (id, entry) in entries_to_cancel {
+                    tracing::info!(
+                        issue_id = %id,
+                        identifier = %entry.issue.identifier,
+                        state = %entry.issue.state,
+                        "Reconcile: cancelling running agent (issue reached terminal/unknown state)"
+                    );
+                    entry.cancel_token.cancel();
                 }
             }
             Err(e) => {
@@ -332,7 +323,12 @@ impl Orchestrator {
     // ---------------------------------------------------------------------- //
 
     /// Return `true` if `issue` should be dispatched this tick.
-    async fn is_eligible(&self, issue: &Issue, config: &ServiceConfig) -> bool {
+    async fn is_eligible(
+        &self,
+        issue: &Issue,
+        config: &ServiceConfig,
+        effective_states: &[String],
+    ) -> bool {
         // Basic field validation.
         if issue.id.is_empty()
             || issue.identifier.is_empty()
@@ -345,7 +341,6 @@ impl Orchestrator {
         let state_lc = issue.state.to_lowercase();
 
         // Must be in an effective active state (respects plan_mode).
-        let (effective_states, _) = config.effective_active_states(self.plan_mode);
         if !effective_states.contains(&state_lc) {
             return false;
         }
@@ -646,7 +641,7 @@ impl Orchestrator {
     // ---------------------------------------------------------------------- //
 
     /// Drain all pending events from `event_rx` (non-blocking).
-    async fn process_events(&mut self) {
+    async fn process_events(&mut self, config: &ServiceConfig) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 WorkerEvent::ClaudeUpdate { issue_id, event } => {
@@ -657,20 +652,12 @@ impl Orchestrator {
                     dispatch_id,
                     reason,
                 } => {
-                    // We need config for backoff calculation and review_state.
-                    // Fall back to sensible defaults if parsing fails.
-                    let (max_backoff, review_state) = {
-                        let workflow = self.config_rx.borrow().clone();
-                        ServiceConfig::from_yaml(&workflow.config)
-                            .map(|c| (c.agent_max_retry_backoff_ms, c.review_state))
-                            .unwrap_or((300_000, None))
-                    };
                     self.handle_worker_exit(
                         &issue_id,
                         dispatch_id,
                         reason,
-                        max_backoff,
-                        review_state,
+                        config.agent_max_retry_backoff_ms,
+                        config.review_state.clone(),
                     )
                     .await;
                 }
@@ -963,144 +950,6 @@ impl Orchestrator {
 }
 
 // -------------------------------------------------------------------------- //
-// Helper functions
-// -------------------------------------------------------------------------- //
-
-/// Build a dependency graph from candidate issues and compute transitive block
-/// counts via BFS, mirroring Venator's `computeTopBlockers` algorithm.
-///
-/// Returns a map of `identifier → count` where count is the number of active
-/// issues transitively blocked by the given issue. Only entries with count > 0
-/// are included.
-pub fn compute_transitive_block_counts(
-    issues: &[Issue],
-    terminal_states: &[String],
-) -> std::collections::HashMap<String, usize> {
-    use std::collections::{HashMap, HashSet, VecDeque};
-
-    // Known universe of identifiers.
-    let universe: HashSet<&str> = issues.iter().map(|i| i.identifier.as_str()).collect();
-
-    // Build forward adjacency (blocker → set of issues it blocks) by inverting
-    // each issue's `blocked_by` field. Track which issues have an active blocker.
-    let mut forward: HashMap<&str, HashSet<&str>> = HashMap::new();
-    let mut has_active_blocker: HashSet<&str> = HashSet::new();
-
-    for issue in issues {
-        for bref in &issue.blocked_by {
-            let blocker_id = match bref.identifier.as_deref() {
-                Some(id) => id,
-                None => continue,
-            };
-            if !universe.contains(blocker_id) {
-                continue;
-            }
-            // Skip terminal blockers — they're done.
-            if let Some(ref st) = bref.state {
-                if terminal_states.contains(&st.to_lowercase()) {
-                    continue;
-                }
-            }
-            forward
-                .entry(blocker_id)
-                .or_default()
-                .insert(issue.identifier.as_str());
-            has_active_blocker.insert(issue.identifier.as_str());
-        }
-    }
-
-    // Unblocked roots: issues with no active blocker.
-    let roots: Vec<&str> = universe
-        .iter()
-        .copied()
-        .filter(|id| !has_active_blocker.contains(id))
-        .collect();
-
-    // BFS from each root to count transitively reachable issues.
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for root in roots {
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        visited.insert(root);
-        queue.push_back(root);
-        while let Some(node) = queue.pop_front() {
-            if let Some(neighbors) = forward.get(node) {
-                for &nb in neighbors {
-                    if visited.insert(nb) {
-                        queue.push_back(nb);
-                    }
-                }
-            }
-        }
-        let count = visited.len() - 1; // exclude self
-        if count > 0 {
-            counts.insert(root.to_string(), count);
-        }
-    }
-
-    counts
-}
-
-/// Sort `issues` in-place by dispatch priority:
-/// 1. Transitive block count descending (most-blocking first).
-/// 2. Priority ascending (None last).
-/// 3. `created_at` oldest first (None last).
-/// 4. `identifier` lexicographic ascending.
-pub fn sort_candidates(
-    issues: &mut [Issue],
-    block_counts: &std::collections::HashMap<String, usize>,
-) {
-    issues.sort_by(|a, b| {
-        // Transitive block count: higher first (descending).
-        let ba = block_counts.get(&a.identifier).copied().unwrap_or(0);
-        let bb = block_counts.get(&b.identifier).copied().unwrap_or(0);
-        let block_cmp = bb.cmp(&ba);
-        if block_cmp != std::cmp::Ordering::Equal {
-            return block_cmp;
-        }
-
-        // Priority: Some(low) < Some(high) < None.
-        let pa = a.priority;
-        let pb = b.priority;
-        let prio_cmp = match (pa, pb) {
-            (Some(x), Some(y)) => x.cmp(&y),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        };
-        if prio_cmp != std::cmp::Ordering::Equal {
-            return prio_cmp;
-        }
-
-        // Created-at: oldest (smallest timestamp) first; None last.
-        let ca = a.created_at;
-        let cb = b.created_at;
-        let date_cmp = match (ca, cb) {
-            (Some(x), Some(y)) => x.cmp(&y),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        };
-        if date_cmp != std::cmp::Ordering::Equal {
-            return date_cmp;
-        }
-
-        // Identifier: lexicographic ascending.
-        a.identifier.cmp(&b.identifier)
-    });
-}
-
-/// Compute exponential backoff for retry `attempt` (1-based), capped at
-/// `max_ms`.
-///
-/// Formula: `min(10_000 * 2^(attempt-1), max_ms)`.
-pub fn compute_backoff(attempt: u32, max_ms: u64) -> u64 {
-    let base = 10_000u64;
-    let exp = 2u64.saturating_pow(attempt.saturating_sub(1));
-    base.saturating_mul(exp).min(max_ms)
-}
-
-// -------------------------------------------------------------------------- //
 // Unit tests
 // -------------------------------------------------------------------------- //
 
@@ -1108,12 +957,11 @@ pub fn compute_backoff(attempt: u32, max_ms: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::domain::{BlockerRef, Comment};
-    use chrono::TimeZone;
-    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
     use tokio_util::sync::CancellationToken;
 
     // ---------------------------------------------------------------------- //
-    // Helpers
+    // Shared test helpers
     // ---------------------------------------------------------------------- //
 
     fn make_issue(id: &str, identifier: &str, state: &str) -> Issue {
@@ -1134,7 +982,6 @@ mod tests {
     }
 
     fn make_config() -> ServiceConfig {
-        use std::collections::HashMap;
         ServiceConfig {
             tracker_kind: "linear".to_string(),
             tracker_api_key: "test-key".to_string(),
@@ -1154,7 +1001,7 @@ mod tests {
             agent_continuation_guidance: "Continue.".to_string(),
             poll_interval_ms: 30_000,
             max_concurrent_agents: 3,
-            max_concurrent_agents_by_state: HashMap::new(),
+            max_concurrent_agents_by_state: std::collections::HashMap::new(),
             active_states: vec!["in progress".to_string(), "todo".to_string()],
             terminal_states: vec!["done".to_string(), "cancelled".to_string()],
             active_states_original: vec!["In Progress".to_string(), "Todo".to_string()],
@@ -1168,238 +1015,105 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------- //
-    // compute_backoff
-    // ---------------------------------------------------------------------- //
+    /// No-op tracker for tests that don't need to spy on calls.
+    struct NullTracker;
 
-    #[test]
-    fn backoff_attempt_1_is_base() {
-        // 2^(1-1) = 1  =>  10_000 * 1 = 10_000
-        assert_eq!(compute_backoff(1, 300_000), 10_000);
+    impl crate::tracker::Tracker for NullTracker {
+        fn fetch_candidate_issues<'a>(&'a self, _: &'a [String], _: &'a [String])
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
+        { Box::pin(async { Ok(vec![]) }) }
+
+        fn fetch_issues_by_states<'a>(&'a self, _: &'a [String], _: &'a [String])
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
+        { Box::pin(async { Ok(vec![]) }) }
+
+        fn fetch_issue_states_by_ids<'a>(&'a self, _: &'a [String])
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
+        { Box::pin(async { Ok(vec![]) }) }
+
+        fn set_issue_state<'a>(&'a self, _: &'a str, _: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
+        { Box::pin(async { Ok(()) }) }
+
+        fn add_label<'a>(&'a self, _: &'a str, _: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
+        { Box::pin(async { Ok(()) }) }
+
+        fn remove_label<'a>(&'a self, _: &'a str, _: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
+        { Box::pin(async { Ok(()) }) }
+
+        fn post_comment<'a>(&'a self, _: &'a str, _: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
+        { Box::pin(async { Ok(()) }) }
+
+        fn fetch_comments<'a>(&'a self, _: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>> + Send + 'a>>
+        { Box::pin(async { Ok(vec![]) }) }
     }
 
-    #[test]
-    fn backoff_attempt_2_doubles() {
-        // 2^(2-1) = 2  =>  10_000 * 2 = 20_000
-        assert_eq!(compute_backoff(2, 300_000), 20_000);
+    /// Tracker that records `set_issue_state` calls for assertions.
+    struct SpyTracker {
+        calls: Arc<StdMutex<Vec<(String, String)>>>,
     }
 
-    #[test]
-    fn backoff_attempt_3() {
-        // 2^(3-1) = 4  =>  10_000 * 4 = 40_000
-        assert_eq!(compute_backoff(3, 300_000), 40_000);
-    }
+    impl crate::tracker::Tracker for SpyTracker {
+        fn fetch_candidate_issues<'a>(&'a self, _: &'a [String], _: &'a [String])
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
+        { Box::pin(async { Ok(vec![]) }) }
 
-    #[test]
-    fn backoff_capped_at_max() {
-        // attempt = 100 would overflow, but saturating_pow + min handles it.
-        assert_eq!(compute_backoff(100, 300_000), 300_000);
-    }
+        fn fetch_issues_by_states<'a>(&'a self, _: &'a [String], _: &'a [String])
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
+        { Box::pin(async { Ok(vec![]) }) }
 
-    #[test]
-    fn backoff_respects_small_max() {
-        assert_eq!(compute_backoff(1, 5_000), 5_000);
-    }
+        fn fetch_issue_states_by_ids<'a>(&'a self, _: &'a [String])
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
+        { Box::pin(async { Ok(vec![]) }) }
 
-    #[test]
-    fn backoff_attempt_0_treated_as_1() {
-        // saturating_sub(1) on 0 gives 0, 2^0 = 1, so still 10_000.
-        assert_eq!(compute_backoff(0, 300_000), 10_000);
-    }
-
-    // ---------------------------------------------------------------------- //
-    // sort_candidates
-    // ---------------------------------------------------------------------- //
-
-    #[test]
-    fn sort_by_priority_ascending_none_last() {
-        let mut issues = vec![
-            {
-                let mut i = make_issue("3", "ENG-3", "todo");
-                i.priority = None;
-                i
-            },
-            {
-                let mut i = make_issue("1", "ENG-1", "todo");
-                i.priority = Some(3);
-                i
-            },
-            {
-                let mut i = make_issue("2", "ENG-2", "todo");
-                i.priority = Some(1);
-                i
-            },
-        ];
-        sort_candidates(&mut issues, &HashMap::new());
-        assert_eq!(issues[0].identifier, "ENG-2"); // priority 1 first
-        assert_eq!(issues[1].identifier, "ENG-1"); // priority 3 second
-        assert_eq!(issues[2].identifier, "ENG-3"); // None last
-    }
-
-    #[test]
-    fn sort_by_created_at_oldest_first_none_last() {
-        let t1 = chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        let t2 = chrono::Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
-
-        let mut issues = vec![
-            {
-                let mut i = make_issue("3", "ENG-3", "todo");
-                i.created_at = None;
-                i
-            },
-            {
-                let mut i = make_issue("2", "ENG-2", "todo");
-                i.created_at = Some(t2);
-                i
-            },
-            {
-                let mut i = make_issue("1", "ENG-1", "todo");
-                i.created_at = Some(t1);
-                i
-            },
-        ];
-        sort_candidates(&mut issues, &HashMap::new());
-        assert_eq!(issues[0].identifier, "ENG-1"); // oldest
-        assert_eq!(issues[1].identifier, "ENG-2");
-        assert_eq!(issues[2].identifier, "ENG-3"); // None last
-    }
-
-    #[test]
-    fn sort_tiebreaker_by_identifier() {
-        let t = chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        let mut issues = vec![
-            {
-                let mut i = make_issue("b", "ENG-B", "todo");
-                i.priority = Some(1);
-                i.created_at = Some(t);
-                i
-            },
-            {
-                let mut i = make_issue("a", "ENG-A", "todo");
-                i.priority = Some(1);
-                i.created_at = Some(t);
-                i
-            },
-        ];
-        sort_candidates(&mut issues, &HashMap::new());
-        assert_eq!(issues[0].identifier, "ENG-A");
-        assert_eq!(issues[1].identifier, "ENG-B");
-    }
-
-    #[test]
-    fn sort_empty_list() {
-        let mut issues: Vec<Issue> = vec![];
-        sort_candidates(&mut issues, &HashMap::new());
-        assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn sort_single_element() {
-        let mut issues = vec![make_issue("1", "ENG-1", "todo")];
-        sort_candidates(&mut issues, &HashMap::new());
-        assert_eq!(issues.len(), 1);
-    }
-
-    // ---------------------------------------------------------------------- //
-    // is_eligible — tested via a live Orchestrator instance
-    // ---------------------------------------------------------------------- //
-
-    /// Build a minimal Orchestrator for testing eligibility.
-    fn make_test_orchestrator() -> Orchestrator {
-        use crate::tracker::Tracker;
-
-        struct NullTracker;
-        impl Tracker for NullTracker {
-            fn fetch_candidate_issues<'a>(
-                &'a self,
-                _: &'a [String],
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn fetch_issues_by_states<'a>(
-                &'a self,
-                _: &'a [String],
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn fetch_issue_states_by_ids<'a>(
-                &'a self,
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn set_issue_state<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn add_label<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn remove_label<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn post_comment<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn fetch_comments<'a>(
-                &'a self,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>>
-                        + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
+        fn set_issue_state<'a>(&'a self, issue_id: &'a str, state_name: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
+        {
+            let calls = Arc::clone(&self.calls);
+            let issue_id = issue_id.to_string();
+            let state_name = state_name.to_string();
+            Box::pin(async move {
+                calls.lock().unwrap().push((issue_id, state_name));
+                Ok(())
+            })
         }
 
+        fn add_label<'a>(&'a self, _: &'a str, _: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
+        { Box::pin(async { Ok(()) }) }
+
+        fn remove_label<'a>(&'a self, _: &'a str, _: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
+        { Box::pin(async { Ok(()) }) }
+
+        fn post_comment<'a>(&'a self, _: &'a str, _: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
+        { Box::pin(async { Ok(()) }) }
+
+        fn fetch_comments<'a>(&'a self, _: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>> + Send + 'a>>
+        { Box::pin(async { Ok(vec![]) }) }
+    }
+
+    /// Build a test orchestrator with a NullTracker.
+    fn make_test_orchestrator(plan_mode: bool) -> Orchestrator {
+        make_test_orchestrator_with_tracker(Arc::new(NullTracker), plan_mode)
+    }
+
+    /// Build a test orchestrator with a custom tracker.
+    fn make_test_orchestrator_with_tracker(
+        tracker: Arc<dyn crate::tracker::Tracker + Send + Sync>,
+        plan_mode: bool,
+    ) -> Orchestrator {
         let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
             config: serde_yaml::Value::Null,
             prompt_template: String::new(),
         }));
         let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
-
-        // Keep sender alive to prevent watch from closing.
         std::mem::forget(config_tx);
 
         Orchestrator::new(
@@ -1408,68 +1122,93 @@ mod tests {
                 prompt_template: String::new(),
             },
             config_rx,
-            Arc::new(NullTracker),
+            tracker,
             refresh_rx,
-            false,
+            plan_mode,
         )
     }
 
+    /// Build a spy orchestrator, returning (orchestrator, spy_calls).
+    fn make_spy_orchestrator(plan_mode: bool) -> (Orchestrator, Arc<StdMutex<Vec<(String, String)>>>) {
+        let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
+        let tracker = Arc::new(SpyTracker {
+            calls: Arc::clone(&spy_calls),
+        });
+        let orch = make_test_orchestrator_with_tracker(tracker, plan_mode);
+        (orch, spy_calls)
+    }
+
+    /// Helper: compute effective_active_states for use in is_eligible tests.
+    fn active_states(config: &ServiceConfig, plan_mode: bool) -> Vec<String> {
+        let (states, _) = config.effective_active_states(plan_mode);
+        states.to_vec()
+    }
+
+    // ---------------------------------------------------------------------- //
+    // is_eligible
+    // ---------------------------------------------------------------------- //
+
     #[tokio::test]
     async fn eligible_basic_happy_path() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
         let issue = make_issue("id-1", "ENG-1", "In Progress");
-        assert!(orch.is_eligible(&issue, &config).await);
+        assert!(orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn ineligible_empty_id() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
         let issue = make_issue("", "ENG-1", "In Progress");
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn ineligible_empty_identifier() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
         let issue = make_issue("id-1", "", "In Progress");
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn ineligible_empty_state() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
         let issue = make_issue("id-1", "ENG-1", "");
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn ineligible_state_not_in_active_states() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
         let issue = make_issue("id-1", "ENG-1", "Backlog");
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn ineligible_state_in_terminal_states() {
-        let orch = make_test_orchestrator();
-        // Make a config where "done" is both active and terminal (edge case).
+        let orch = make_test_orchestrator(false);
         let mut config = make_config();
         config.active_states.push("done".to_string());
+        let states = active_states(&config, false);
         let issue = make_issue("id-1", "ENG-1", "Done");
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn ineligible_when_running() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
 
-        // Insert a fake running entry.
         {
             let mut state = orch.state.lock().await;
             state.running.insert(
@@ -1486,13 +1225,14 @@ mod tests {
         }
 
         let issue = make_issue("id-1", "ENG-1", "In Progress");
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn ineligible_when_claimed() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
 
         {
             let mut state = orch.state.lock().await;
@@ -1500,16 +1240,16 @@ mod tests {
         }
 
         let issue = make_issue("id-1", "ENG-1", "In Progress");
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn ineligible_global_concurrency_limit() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let mut config = make_config();
         config.max_concurrent_agents = 1;
+        let states = active_states(&config, false);
 
-        // Insert one running entry to saturate the limit.
         {
             let mut state = orch.state.lock().await;
             state.running.insert(
@@ -1526,18 +1266,18 @@ mod tests {
         }
 
         let issue = make_issue("id-1", "ENG-1", "In Progress");
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn ineligible_per_state_concurrency_limit() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let mut config = make_config();
         config
             .max_concurrent_agents_by_state
             .insert("in progress".to_string(), 1);
+        let states = active_states(&config, false);
 
-        // Insert one running entry in "In Progress".
         {
             let mut state = orch.state.lock().await;
             state.running.insert(
@@ -1554,13 +1294,14 @@ mod tests {
         }
 
         let issue = make_issue("id-1", "ENG-1", "In Progress");
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn todo_blocker_rule_all_done() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
 
         let mut issue = make_issue("id-1", "ENG-1", "Todo");
         issue.blocked_by = vec![
@@ -1576,167 +1317,49 @@ mod tests {
             },
         ];
 
-        assert!(orch.is_eligible(&issue, &config).await);
+        assert!(orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn todo_blocker_rule_blocker_not_done() {
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
 
         let mut issue = make_issue("id-1", "ENG-1", "Todo");
         issue.blocked_by = vec![BlockerRef {
             id: Some("b-1".to_string()),
             identifier: Some("ENG-0".to_string()),
-            state: Some("In Progress".to_string()), // not terminal
+            state: Some("In Progress".to_string()),
         }];
 
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn todo_blocker_rule_blocker_state_none_is_allowed() {
-        // If a blocker has no state, we cannot determine if it's blocking — allow.
-        let orch = make_test_orchestrator();
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
 
         let mut issue = make_issue("id-1", "ENG-1", "Todo");
         issue.blocked_by = vec![BlockerRef {
             id: Some("b-1".to_string()),
             identifier: Some("ENG-0".to_string()),
-            state: None, // unknown state
+            state: None,
         }];
 
-        assert!(orch.is_eligible(&issue, &config).await);
+        assert!(orch.is_eligible(&issue, &config, &states).await);
     }
 
     // ---------------------------------------------------------------------- //
-    // review_state — set_issue_state called on normal worker exit
+    // review_state
     // ---------------------------------------------------------------------- //
 
     #[tokio::test]
     async fn review_state_calls_set_issue_state_on_normal_exit() {
-        use std::sync::Mutex as StdMutex;
+        let (mut orch, spy_calls) = make_spy_orchestrator(false);
 
-        // A tracker that records every set_issue_state call.
-        struct SpyTracker {
-            calls: Arc<StdMutex<Vec<(String, String)>>>,
-        }
-
-        impl crate::tracker::Tracker for SpyTracker {
-            fn fetch_candidate_issues<'a>(
-                &'a self,
-                _: &'a [String],
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn fetch_issues_by_states<'a>(
-                &'a self,
-                _: &'a [String],
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn fetch_issue_states_by_ids<'a>(
-                &'a self,
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn set_issue_state<'a>(
-                &'a self,
-                issue_id: &'a str,
-                state_name: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                let calls = Arc::clone(&self.calls);
-                let issue_id = issue_id.to_string();
-                let state_name = state_name.to_string();
-                Box::pin(async move {
-                    calls.lock().unwrap().push((issue_id, state_name));
-                    Ok(())
-                })
-            }
-
-            fn add_label<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn remove_label<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn post_comment<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn fetch_comments<'a>(
-                &'a self,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>>
-                        + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-        }
-
-        let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
-        let tracker = Arc::new(SpyTracker {
-            calls: Arc::clone(&spy_calls),
-        });
-
-        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
-            config: serde_yaml::Value::Null,
-            prompt_template: String::new(),
-        }));
-        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
-        std::mem::forget(config_tx);
-
-        let mut orch = Orchestrator::new(
-            WorkflowDefinition {
-                config: serde_yaml::Value::Null,
-                prompt_template: String::new(),
-            },
-            config_rx,
-            tracker,
-            refresh_rx,
-            false,
-        );
-
-        // Seed a running entry so handle_worker_exit finds it.
         {
             let mut state = orch.state.lock().await;
             state.running.insert(
@@ -1762,163 +1385,32 @@ mod tests {
         )
         .await;
 
-        // set_issue_state should have been called once with the right arguments.
         let calls = spy_calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "expected exactly one set_issue_state call");
         assert_eq!(calls[0].0, "issue-abc");
         assert_eq!(calls[0].1, "In Review");
         drop(calls);
 
-        // Issue should be marked completed, not retried.
         let state = orch.state.lock().await;
-        assert!(
-            state.completed.contains("issue-abc"),
-            "issue should be marked completed after review state transition"
-        );
-        assert!(
-            !state.claimed.contains("issue-abc"),
-            "issue should be removed from claimed"
-        );
-        assert!(
-            !state.retry_attempts.contains_key("issue-abc"),
-            "no retry should be scheduled when review state succeeds"
-        );
+        assert!(state.completed.contains("issue-abc"));
+        assert!(!state.claimed.contains("issue-abc"));
+        assert!(!state.retry_attempts.contains_key("issue-abc"));
     }
 
     // ---------------------------------------------------------------------- //
-    // started_state — set_issue_state called on dispatch when state differs
+    // started_state
     // ---------------------------------------------------------------------- //
 
     #[tokio::test]
     async fn started_state_calls_set_issue_state_on_dispatch() {
-        use std::sync::Mutex as StdMutex;
-
-        struct SpyTracker {
-            calls: Arc<StdMutex<Vec<(String, String)>>>,
-        }
-
-        impl crate::tracker::Tracker for SpyTracker {
-            fn fetch_candidate_issues<'a>(
-                &'a self,
-                _: &'a [String],
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn fetch_issues_by_states<'a>(
-                &'a self,
-                _: &'a [String],
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn fetch_issue_states_by_ids<'a>(
-                &'a self,
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn set_issue_state<'a>(
-                &'a self,
-                issue_id: &'a str,
-                state_name: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                let calls = Arc::clone(&self.calls);
-                let issue_id = issue_id.to_string();
-                let state_name = state_name.to_string();
-                Box::pin(async move {
-                    calls.lock().unwrap().push((issue_id, state_name));
-                    Ok(())
-                })
-            }
-
-            fn add_label<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn remove_label<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn post_comment<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn fetch_comments<'a>(
-                &'a self,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>>
-                        + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-        }
-
-        let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
-        let tracker = Arc::new(SpyTracker {
-            calls: Arc::clone(&spy_calls),
-        });
-
-        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
-            config: serde_yaml::Value::Null,
-            prompt_template: String::new(),
-        }));
-        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
-        std::mem::forget(config_tx);
-
-        let mut orch = Orchestrator::new(
-            WorkflowDefinition {
-                config: serde_yaml::Value::Null,
-                prompt_template: String::new(),
-            },
-            config_rx,
-            tracker,
-            refresh_rx,
-            false,
-        );
+        let (mut orch, spy_calls) = make_spy_orchestrator(false);
 
         let mut config = make_config();
         config.started_state = Some("In Progress".to_string());
 
-        // Issue is in "Todo" — different from started_state, so a transition is expected.
         let issue = make_issue("issue-xyz", "ENG-99", "Todo");
-
         orch.dispatch(issue, &config).await;
 
-        // set_issue_state must have been called once with the right arguments.
         let calls = spy_calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "expected exactly one set_issue_state call");
         assert_eq!(calls[0].0, "issue-xyz");
@@ -1927,131 +1419,12 @@ mod tests {
 
     #[tokio::test]
     async fn started_state_skipped_when_issue_already_in_that_state() {
-        use std::sync::Mutex as StdMutex;
-
-        struct SpyTracker {
-            calls: Arc<StdMutex<Vec<(String, String)>>>,
-        }
-
-        impl crate::tracker::Tracker for SpyTracker {
-            fn fetch_candidate_issues<'a>(
-                &'a self,
-                _: &'a [String],
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn fetch_issues_by_states<'a>(
-                &'a self,
-                _: &'a [String],
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn fetch_issue_states_by_ids<'a>(
-                &'a self,
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn set_issue_state<'a>(
-                &'a self,
-                issue_id: &'a str,
-                state_name: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                let calls = Arc::clone(&self.calls);
-                let issue_id = issue_id.to_string();
-                let state_name = state_name.to_string();
-                Box::pin(async move {
-                    calls.lock().unwrap().push((issue_id, state_name));
-                    Ok(())
-                })
-            }
-
-            fn add_label<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn remove_label<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn post_comment<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn fetch_comments<'a>(
-                &'a self,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>>
-                        + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-        }
-
-        let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
-        let tracker = Arc::new(SpyTracker {
-            calls: Arc::clone(&spy_calls),
-        });
-
-        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
-            config: serde_yaml::Value::Null,
-            prompt_template: String::new(),
-        }));
-        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
-        std::mem::forget(config_tx);
-
-        let mut orch = Orchestrator::new(
-            WorkflowDefinition {
-                config: serde_yaml::Value::Null,
-                prompt_template: String::new(),
-            },
-            config_rx,
-            tracker,
-            refresh_rx,
-            false,
-        );
+        let (mut orch, spy_calls) = make_spy_orchestrator(false);
 
         let mut config = make_config();
         config.started_state = Some("In Progress".to_string());
 
-        // Issue is already in "In Progress" — no transition should happen.
         let issue = make_issue("issue-xyz", "ENG-99", "In Progress");
-
         orch.dispatch(issue, &config).await;
 
         let calls = spy_calls.lock().unwrap();
@@ -2063,339 +1436,65 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------- //
-    // compute_transitive_block_counts
-    // ---------------------------------------------------------------------- //
-
-    fn terminal() -> Vec<String> {
-        vec!["done".to_string(), "cancelled".to_string()]
-    }
-
-    #[test]
-    fn block_counts_empty_when_no_blockers() {
-        let issues = vec![
-            make_issue("1", "ENG-1", "todo"),
-            make_issue("2", "ENG-2", "todo"),
-        ];
-        let counts = compute_transitive_block_counts(&issues, &terminal());
-        assert!(counts.is_empty());
-    }
-
-    #[test]
-    fn block_counts_simple_chain() {
-        // A blocks B blocks C  =>  A: 2, B: 1
-        let a = make_issue("a", "ENG-A", "todo");
-        let mut b = make_issue("b", "ENG-B", "todo");
-        b.blocked_by = vec![BlockerRef {
-            id: None,
-            identifier: Some("ENG-A".to_string()),
-            state: Some("todo".to_string()),
-        }];
-        let mut c = make_issue("c", "ENG-C", "todo");
-        c.blocked_by = vec![BlockerRef {
-            id: None,
-            identifier: Some("ENG-B".to_string()),
-            state: Some("todo".to_string()),
-        }];
-
-        let counts = compute_transitive_block_counts(&[a, b, c], &terminal());
-        assert_eq!(counts.get("ENG-A").copied().unwrap_or(0), 2);
-        // B is not a root (blocked by A), so it has no entry.
-        assert_eq!(counts.get("ENG-B").copied().unwrap_or(0), 0);
-        assert_eq!(counts.get("ENG-C").copied().unwrap_or(0), 0);
-    }
-
-    #[test]
-    fn block_counts_diamond() {
-        // A blocks B and C; B and C both block D  =>  A: 3, B: 1, C: 1
-        let a = make_issue("a", "ENG-A", "todo");
-        let mut b = make_issue("b", "ENG-B", "todo");
-        b.blocked_by = vec![BlockerRef {
-            id: None,
-            identifier: Some("ENG-A".to_string()),
-            state: Some("todo".to_string()),
-        }];
-        let mut c = make_issue("c", "ENG-C", "todo");
-        c.blocked_by = vec![BlockerRef {
-            id: None,
-            identifier: Some("ENG-A".to_string()),
-            state: Some("todo".to_string()),
-        }];
-        let mut d = make_issue("d", "ENG-D", "todo");
-        d.blocked_by = vec![
-            BlockerRef {
-                id: None,
-                identifier: Some("ENG-B".to_string()),
-                state: Some("todo".to_string()),
-            },
-            BlockerRef {
-                id: None,
-                identifier: Some("ENG-C".to_string()),
-                state: Some("todo".to_string()),
-            },
-        ];
-
-        let counts = compute_transitive_block_counts(&[a, b, c, d], &terminal());
-        assert_eq!(counts.get("ENG-A").copied().unwrap_or(0), 3);
-        // B and C are not roots (blocked by A), so they have no entry.
-        assert_eq!(counts.get("ENG-B").copied().unwrap_or(0), 0);
-        assert_eq!(counts.get("ENG-C").copied().unwrap_or(0), 0);
-        assert_eq!(counts.get("ENG-D").copied().unwrap_or(0), 0);
-    }
-
-    #[test]
-    fn block_counts_terminal_blocker_excluded() {
-        // A blocks B, but A's state is "done" (terminal) => edge excluded, both 0
-        let a = make_issue("a", "ENG-A", "todo");
-        let mut b = make_issue("b", "ENG-B", "todo");
-        b.blocked_by = vec![BlockerRef {
-            id: None,
-            identifier: Some("ENG-A".to_string()),
-            state: Some("Done".to_string()),
-        }];
-
-        let counts = compute_transitive_block_counts(&[a, b], &terminal());
-        assert!(counts.is_empty());
-    }
-
-    #[test]
-    fn block_counts_external_blocker_ignored() {
-        // B blocked by X (not in candidate set) => B is unblocked root, count 0
-        let mut b = make_issue("b", "ENG-B", "todo");
-        b.blocked_by = vec![BlockerRef {
-            id: None,
-            identifier: Some("ENG-X".to_string()),
-            state: Some("todo".to_string()),
-        }];
-
-        let counts = compute_transitive_block_counts(&[b], &terminal());
-        assert!(counts.is_empty());
-    }
-
-    #[test]
-    fn block_counts_disjoint_subgraphs() {
-        // A->B->C and D->E  =>  A: 2, B: 1, D: 1
-        let a = make_issue("a", "ENG-A", "todo");
-        let mut b = make_issue("b", "ENG-B", "todo");
-        b.blocked_by = vec![BlockerRef {
-            id: None,
-            identifier: Some("ENG-A".to_string()),
-            state: Some("todo".to_string()),
-        }];
-        let mut c = make_issue("c", "ENG-C", "todo");
-        c.blocked_by = vec![BlockerRef {
-            id: None,
-            identifier: Some("ENG-B".to_string()),
-            state: Some("todo".to_string()),
-        }];
-        let d = make_issue("d", "ENG-D", "todo");
-        let mut e = make_issue("e", "ENG-E", "todo");
-        e.blocked_by = vec![BlockerRef {
-            id: None,
-            identifier: Some("ENG-D".to_string()),
-            state: Some("todo".to_string()),
-        }];
-
-        let counts = compute_transitive_block_counts(&[a, b, c, d, e], &terminal());
-        assert_eq!(counts.get("ENG-A").copied().unwrap_or(0), 2);
-        // B is not a root (blocked by A).
-        assert_eq!(counts.get("ENG-B").copied().unwrap_or(0), 0);
-        assert_eq!(counts.get("ENG-D").copied().unwrap_or(0), 1);
-    }
-
-    #[test]
-    fn sort_block_count_is_primary_key() {
-        // A: block_count=3, priority=4; B: block_count=0, priority=1
-        // Block count should win over priority.
-        let mut a = make_issue("a", "ENG-A", "todo");
-        a.priority = Some(4);
-        let mut b = make_issue("b", "ENG-B", "todo");
-        b.priority = Some(1);
-
-        let mut counts = HashMap::new();
-        counts.insert("ENG-A".to_string(), 3usize);
-
-        let mut issues = vec![b, a];
-        sort_candidates(&mut issues, &counts);
-        assert_eq!(issues[0].identifier, "ENG-A"); // higher block count first
-        assert_eq!(issues[1].identifier, "ENG-B");
-    }
-
-    #[test]
-    fn sort_block_count_tie_falls_through_to_priority() {
-        let mut a = make_issue("a", "ENG-A", "todo");
-        a.priority = Some(3);
-        let mut b = make_issue("b", "ENG-B", "todo");
-        b.priority = Some(1);
-
-        // Both have same block count (0).
-        let mut issues = vec![a, b];
-        sort_candidates(&mut issues, &HashMap::new());
-        assert_eq!(issues[0].identifier, "ENG-B"); // lower priority number first
-        assert_eq!(issues[1].identifier, "ENG-A");
-    }
-
-    // ---------------------------------------------------------------------- //
     // Plan mode — is_eligible label skipping
     // ---------------------------------------------------------------------- //
 
-    fn make_plan_mode_orchestrator() -> Orchestrator {
-        use crate::tracker::Tracker;
-
-        struct NullTracker;
-        impl Tracker for NullTracker {
-            fn fetch_candidate_issues<'a>(
-                &'a self,
-                _: &'a [String],
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn fetch_issues_by_states<'a>(
-                &'a self,
-                _: &'a [String],
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn fetch_issue_states_by_ids<'a>(
-                &'a self,
-                _: &'a [String],
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-
-            fn set_issue_state<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn add_label<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn remove_label<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn post_comment<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn fetch_comments<'a>(
-                &'a self,
-                _: &'a str,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>>
-                        + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(vec![]) })
-            }
-        }
-
-        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(WorkflowDefinition {
-            config: serde_yaml::Value::Null,
-            prompt_template: String::new(),
-        }));
-        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<()>(1);
-        std::mem::forget(config_tx);
-
-        Orchestrator::new(
-            WorkflowDefinition {
-                config: serde_yaml::Value::Null,
-                prompt_template: String::new(),
-            },
-            config_rx,
-            Arc::new(NullTracker),
-            refresh_rx,
-            true, // plan_mode = true
-        )
-    }
-
     #[tokio::test]
     async fn plan_mode_skips_planning_label() {
-        let orch = make_plan_mode_orchestrator();
+        let orch = make_test_orchestrator(true);
         let config = make_config();
+        let states = active_states(&config, true);
         let mut issue = make_issue("id-1", "ENG-1", "In Progress");
         issue.labels = vec!["needs plan".to_string(), "planning...".to_string()];
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn plan_mode_skips_plan_ready_label() {
-        let orch = make_plan_mode_orchestrator();
+        let orch = make_test_orchestrator(true);
         let config = make_config();
+        let states = active_states(&config, true);
         let mut issue = make_issue("id-1", "ENG-1", "In Progress");
         issue.labels = vec!["needs plan".to_string(), "plan ready".to_string()];
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn plan_mode_requires_needs_plan_label() {
-        let orch = make_plan_mode_orchestrator();
+        let orch = make_test_orchestrator(true);
         let config = make_config();
+        let states = active_states(&config, true);
         let issue = make_issue("id-1", "ENG-1", "In Progress");
-        // No "needs plan" label — should be ineligible.
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn plan_mode_allows_issue_with_needs_plan_label() {
-        let orch = make_plan_mode_orchestrator();
+        let orch = make_test_orchestrator(true);
         let config = make_config();
+        let states = active_states(&config, true);
         let mut issue = make_issue("id-1", "ENG-1", "In Progress");
         issue.labels = vec!["needs plan".to_string()];
-        assert!(orch.is_eligible(&issue, &config).await);
+        assert!(orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn normal_mode_skips_planning_label() {
-        let orch = make_test_orchestrator(); // plan_mode = false
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
         let mut issue = make_issue("id-1", "ENG-1", "In Progress");
         issue.labels = vec!["planning...".to_string()];
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 
     #[tokio::test]
     async fn normal_mode_skips_needs_plan_label() {
-        let orch = make_test_orchestrator(); // plan_mode = false
+        let orch = make_test_orchestrator(false);
         let config = make_config();
+        let states = active_states(&config, false);
         let mut issue = make_issue("id-1", "ENG-1", "In Progress");
         issue.labels = vec!["needs plan".to_string()];
-        assert!(!orch.is_eligible(&issue, &config).await);
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 }

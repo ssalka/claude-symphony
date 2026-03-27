@@ -4,6 +4,7 @@ pub mod domain;
 pub mod error;
 pub mod orchestrator;
 pub mod prompt;
+pub mod scheduling;
 pub mod server;
 pub mod tracker;
 pub mod workflow;
