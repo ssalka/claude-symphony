@@ -156,12 +156,8 @@ impl AgentRunner {
     ) -> Result<String> {
         let workspace = workspace::create_for_issue(&issue.identifier, &self.config).await?;
 
-        let base_prompt = prompt::render_prompt(
-            &self.workflow.prompt_template,
-            &issue,
-            Some(attempt),
-            None,
-        )?;
+        let base_prompt =
+            prompt::render_prompt(&self.workflow.prompt_template, &issue, Some(attempt), None)?;
 
         let prompt = format!(
             "You are in PLANNING MODE. Do NOT make any code changes, create branches, or open PRs.\n\

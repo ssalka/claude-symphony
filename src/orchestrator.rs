@@ -507,8 +507,7 @@ impl Orchestrator {
                 let reason = match result {
                     Ok(plan_text) => {
                         // 3. Post plan as comment (with sentinel marker).
-                        let comment_body =
-                            format!("<!-- symphony-plan -->\n{plan_text}");
+                        let comment_body = format!("<!-- symphony-plan -->\n{plan_text}");
                         if let Err(e) = tracker.post_comment(&issue_id_clone, &comment_body).await {
                             tracing::error!(
                                 issue_id = %issue_id_clone,
@@ -1037,37 +1036,83 @@ mod tests {
     struct NullTracker;
 
     impl crate::tracker::Tracker for NullTracker {
-        fn fetch_candidate_issues<'a>(&'a self, _: &'a [String], _: &'a [String])
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
-        { Box::pin(async { Ok(vec![]) }) }
+        fn fetch_candidate_issues<'a>(
+            &'a self,
+            _: &'a [String],
+            _: &'a [String],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
 
-        fn fetch_issues_by_states<'a>(&'a self, _: &'a [String], _: &'a [String])
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
-        { Box::pin(async { Ok(vec![]) }) }
+        fn fetch_issues_by_states<'a>(
+            &'a self,
+            _: &'a [String],
+            _: &'a [String],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
 
-        fn fetch_issue_states_by_ids<'a>(&'a self, _: &'a [String])
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
-        { Box::pin(async { Ok(vec![]) }) }
+        fn fetch_issue_states_by_ids<'a>(
+            &'a self,
+            _: &'a [String],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
 
-        fn set_issue_state<'a>(&'a self, _: &'a str, _: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
-        { Box::pin(async { Ok(()) }) }
+        fn set_issue_state<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
 
-        fn add_label<'a>(&'a self, _: &'a str, _: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
-        { Box::pin(async { Ok(()) }) }
+        fn add_label<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
 
-        fn remove_label<'a>(&'a self, _: &'a str, _: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
-        { Box::pin(async { Ok(()) }) }
+        fn remove_label<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
 
-        fn post_comment<'a>(&'a self, _: &'a str, _: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
-        { Box::pin(async { Ok(()) }) }
+        fn post_comment<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
 
-        fn fetch_comments<'a>(&'a self, _: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>> + Send + 'a>>
-        { Box::pin(async { Ok(vec![]) }) }
+        fn fetch_comments<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
     }
 
     /// Tracker that records `set_issue_state` calls for assertions.
@@ -1076,21 +1121,42 @@ mod tests {
     }
 
     impl crate::tracker::Tracker for SpyTracker {
-        fn fetch_candidate_issues<'a>(&'a self, _: &'a [String], _: &'a [String])
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
-        { Box::pin(async { Ok(vec![]) }) }
+        fn fetch_candidate_issues<'a>(
+            &'a self,
+            _: &'a [String],
+            _: &'a [String],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
 
-        fn fetch_issues_by_states<'a>(&'a self, _: &'a [String], _: &'a [String])
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
-        { Box::pin(async { Ok(vec![]) }) }
+        fn fetch_issues_by_states<'a>(
+            &'a self,
+            _: &'a [String],
+            _: &'a [String],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
 
-        fn fetch_issue_states_by_ids<'a>(&'a self, _: &'a [String])
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>>
-        { Box::pin(async { Ok(vec![]) }) }
+        fn fetch_issue_states_by_ids<'a>(
+            &'a self,
+            _: &'a [String],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<Vec<Issue>>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
 
-        fn set_issue_state<'a>(&'a self, issue_id: &'a str, state_name: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
-        {
+        fn set_issue_state<'a>(
+            &'a self,
+            issue_id: &'a str,
+            state_name: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+        > {
             let calls = Arc::clone(&self.calls);
             let issue_id = issue_id.to_string();
             let state_name = state_name.to_string();
@@ -1100,21 +1166,44 @@ mod tests {
             })
         }
 
-        fn add_label<'a>(&'a self, _: &'a str, _: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
-        { Box::pin(async { Ok(()) }) }
+        fn add_label<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
 
-        fn remove_label<'a>(&'a self, _: &'a str, _: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
-        { Box::pin(async { Ok(()) }) }
+        fn remove_label<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
 
-        fn post_comment<'a>(&'a self, _: &'a str, _: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
-        { Box::pin(async { Ok(()) }) }
+        fn post_comment<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
 
-        fn fetch_comments<'a>(&'a self, _: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>> + Send + 'a>>
-        { Box::pin(async { Ok(vec![]) }) }
+        fn fetch_comments<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<Vec<Comment>>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
     }
 
     /// Build a test orchestrator with a NullTracker.
@@ -1147,7 +1236,9 @@ mod tests {
     }
 
     /// Build a spy orchestrator, returning (orchestrator, spy_calls).
-    fn make_spy_orchestrator(plan_mode: bool) -> (Orchestrator, Arc<StdMutex<Vec<(String, String)>>>) {
+    fn make_spy_orchestrator(
+        plan_mode: bool,
+    ) -> (Orchestrator, Arc<StdMutex<Vec<(String, String)>>>) {
         let spy_calls: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(vec![]));
         let tracker = Arc::new(SpyTracker {
             calls: Arc::clone(&spy_calls),

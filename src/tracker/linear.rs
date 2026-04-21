@@ -700,11 +700,7 @@ impl LinearClient {
     // ---------------------------------------------------------------------- //
 
     /// Find the label ID by name in the issue's team, or create it if missing.
-    async fn resolve_or_create_label(
-        &self,
-        issue_id: &str,
-        label_name: &str,
-    ) -> Result<String> {
+    async fn resolve_or_create_label(&self, issue_id: &str, label_name: &str) -> Result<String> {
         let vars = serde_json::json!({
             "issueId": issue_id,
             "labelName": label_name,

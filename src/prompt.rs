@@ -298,7 +298,13 @@ mod tests {
     #[test]
     fn test_labels_empty() {
         let issue = base_issue();
-        let out = render_prompt("{% for l in labels %}{{l}},{% endfor %}", &issue, None, None).unwrap();
+        let out = render_prompt(
+            "{% for l in labels %}{{l}},{% endfor %}",
+            &issue,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(out, "");
     }
 
@@ -544,8 +550,7 @@ Attempt: {{ attempt }}"#;
     #[test]
     fn test_plan_some_renders_text() {
         let issue = base_issue();
-        let out =
-            render_prompt("plan:{{ plan }}", &issue, None, Some("My plan")).unwrap();
+        let out = render_prompt("plan:{{ plan }}", &issue, None, Some("My plan")).unwrap();
         assert_eq!(out, "plan:My plan");
     }
 
