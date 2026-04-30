@@ -40,6 +40,8 @@ pub struct ServiceConfig {
     pub terminal_states_original: Vec<String>,
     pub planning_states: Vec<String>,
     pub planning_states_original: Vec<String>,
+    /// Labels (lowercased) that cause an issue to be skipped entirely.
+    pub ignore_labels: Vec<String>,
     /// If set, the agent will move the issue to this state once it has claimed the issue
     /// (if the issue wasn't already in that state).
     pub started_state: Option<String>,
@@ -266,6 +268,16 @@ impl ServiceConfig {
             .map(parse_state_list_preserve_case)
             .unwrap_or_default();
 
+        let ignore_labels = orchestrator
+            .get("ignore_labels")
+            .map(|v| {
+                parse_slug_list(v)
+                    .into_iter()
+                    .map(|s| s.to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let started_state = opt_str(orchestrator, "started_state").map(str::to_string);
         let review_state = opt_str(orchestrator, "review_state").map(str::to_string);
 
@@ -309,6 +321,7 @@ impl ServiceConfig {
             terminal_states_original,
             planning_states,
             planning_states_original,
+            ignore_labels,
             started_state,
             review_state,
             server_enabled,
@@ -882,6 +895,40 @@ orchestrator:
         let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
         assert!(cfg.planning_states.is_empty());
         assert!(cfg.planning_states_original.is_empty());
+    }
+
+    // ---- ignore_labels ------------------------------------------------------
+
+    #[test]
+    fn test_ignore_labels_empty_by_default() {
+        let yaml = minimal_yaml("key");
+        let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
+        assert!(cfg.ignore_labels.is_empty());
+    }
+
+    #[test]
+    fn test_ignore_labels_parsed_and_lowercased() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+tracker:
+  kind: linear
+  api_key: k
+  project_slugs: [p]
+workspace:
+  root: /tmp
+agent:
+  command: claude
+orchestrator:
+  active_states:
+    - In Progress
+  ignore_labels:
+    - Needs Human
+    - On Hold
+"#,
+        )
+        .unwrap();
+        let cfg = ServiceConfig::from_yaml(&yaml).unwrap();
+        assert_eq!(cfg.ignore_labels, vec!["needs human", "on hold"]);
     }
 
     #[test]

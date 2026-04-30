@@ -283,6 +283,7 @@ mod tests {
             terminal_states_original: vec![],
             planning_states: vec![],
             planning_states_original: vec![],
+            ignore_labels: vec![],
             started_state: None,
             review_state: None,
             server_enabled: false,

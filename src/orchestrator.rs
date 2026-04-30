@@ -372,6 +372,16 @@ impl Orchestrator {
             return false;
         }
 
+        // Skip issues that have any configured ignore label.
+        if !config.ignore_labels.is_empty()
+            && issue
+                .labels
+                .iter()
+                .any(|l| config.ignore_labels.contains(&l.to_lowercase()))
+        {
+            return false;
+        }
+
         let state = self.state.lock().await;
 
         // Must not already be running.
@@ -1025,6 +1035,7 @@ mod tests {
             terminal_states_original: vec!["Done".to_string(), "Cancelled".to_string()],
             planning_states: vec![],
             planning_states_original: vec![],
+            ignore_labels: vec![],
             started_state: None,
             review_state: None,
             server_enabled: false,
@@ -1604,6 +1615,40 @@ mod tests {
         let states = active_states(&config, false);
         let mut issue = make_issue("id-1", "ENG-1", "In Progress");
         issue.labels = vec!["needs plan".to_string()];
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
+    }
+
+    #[tokio::test]
+    async fn skips_ignore_label() {
+        let orch = make_test_orchestrator(false);
+        let mut config = make_config();
+        config.ignore_labels = vec!["needs human".to_string()];
+        let states = active_states(&config, false);
+        let mut issue = make_issue("id-1", "ENG-1", "In Progress");
+        issue.labels = vec!["Needs Human".to_string()];
+        assert!(!orch.is_eligible(&issue, &config, &states).await);
+    }
+
+    #[tokio::test]
+    async fn no_ignore_labels_does_not_skip() {
+        let orch = make_test_orchestrator(false);
+        let config = make_config();
+        let states = active_states(&config, false);
+        let mut issue = make_issue("id-1", "ENG-1", "In Progress");
+        issue.labels = vec!["Needs Human".to_string()];
+        assert!(orch.is_eligible(&issue, &config, &states).await);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_skips_ignore_label() {
+        let orch = make_test_orchestrator(true);
+        let mut config = make_config();
+        config.ignore_labels = vec!["needs human".to_string()];
+        config.planning_states = vec!["in progress".to_string()];
+        config.planning_states_original = vec!["In Progress".to_string()];
+        let states = active_states(&config, true);
+        let mut issue = make_issue("id-1", "ENG-1", "In Progress");
+        issue.labels = vec!["needs plan".to_string(), "Needs Human".to_string()];
         assert!(!orch.is_eligible(&issue, &config, &states).await);
     }
 }
